@@ -1,0 +1,3996 @@
+// main_complete.cpp
+#include <opencv2/opencv.hpp>
+#include <GLFW/glfw3.h>
+#include "imgui.h"
+#include "imgui_impl_glfw.h"
+#include "imgui_impl_opengl3.h" 
+#include "tinyfiledialogs.h"
+#include <iostream>
+#include <stack>
+#include <string>
+#include <vector>
+#include <map>
+#include <windows.h>
+#include <algorithm>
+#include <numeric>
+#include <queue>
+#include <bitset>
+#include <functional>
+
+using namespace cv;
+using namespace std;
+
+// Global Variables 
+Mat imgOriginal, imgProcessed;
+GLuint texOriginal = 0, texProcessed = 0;
+stack<Mat> undoStack;
+bool showImageInfo = true;
+bool darkMode = false; 
+bool showHelpWindow = false;
+
+// Compression Global Variables
+static bool showCompressionWindow = false;
+static bool showHuffmanWindow = false;
+static bool showLossyWindow = false;
+static bool showCropWindow = false;
+static Mat compressedImage, huffmanImage, lossyImage, croppedImage;
+static GLuint texCompressed = 0, texHuffman = 0, texLossy = 0, texCropped = 0;
+static float compressionQuality = 50.0f;
+static float cropX = 0.0f, cropY = 0.0f, cropWidth = 100.0f, cropHeight = 100.0f;
+static float dctQuality = 50.0f;
+
+// DFT Global Variables 
+static bool showDFTWindow = false;
+static int dftCutoff = 30;
+static int dftMaxCutoff = 200;
+static bool dftProcessed = false;
+static Mat dftOriginal, dftGray, dftFiltered;
+static Mat dftMagnitudeBefore, dftMagnitudeAfter;
+static GLuint texDFTBefore = 0, texDFTAfter = 0, texDFTFiltered = 0;
+
+// Edge Detection Global Variables
+static bool showEdgeSegWindow = false;
+static int edgeThreshold = 100;
+static Mat edgeSegResult, regionSegResult;
+static GLuint texEdgeSeg = 0, texRegionSeg = 0;
+
+// Histogram Global Variables
+static Mat histogramImage;
+static GLuint texHistogram = 0;
+void updateHistogram();
+GLuint matToTexture(const Mat& mat, GLuint& texID);
+
+//comperation
+struct CompressionMetrics {
+    double cr = 0;
+    double rmse = 0;
+    double psnr = 0;
+    double originalSize = 0;
+    double compressedSize = 0;
+};
+
+static CompressionMetrics huffmanMetrics;
+static CompressionMetrics lossyMetrics;
+// Huffman Node Structure
+struct HuffmanNode {
+    int pixelValue;
+    int frequency;
+    HuffmanNode* left;
+    HuffmanNode* right;
+
+    HuffmanNode(int val, int freq) : pixelValue(val), frequency(freq), left(nullptr), right(nullptr) {}
+};
+
+// Comparison function for priority queue
+struct CompareNodes {
+    bool operator()(HuffmanNode* a, HuffmanNode* b) {
+        return a->frequency > b->frequency;
+    }
+};
+
+// Function to delete Huffman tree
+void deleteHuffmanTree(HuffmanNode* root) {
+    if (root == nullptr) return;
+    deleteHuffmanTree(root->left);
+    deleteHuffmanTree(root->right);
+    delete root;
+}
+
+void pushUndo() {
+    if (!imgProcessed.empty()) {
+        undoStack.push(imgProcessed.clone());
+        updateHistogram();
+    }
+}
+
+void undoLast() {
+    if (!undoStack.empty()) {
+        imgProcessed = undoStack.top();
+        undoStack.pop();
+        matToTexture(imgProcessed, texProcessed);
+        updateHistogram();
+    }
+}
+
+//Load / Texture 
+bool loadImageFromDialog(Mat& out) {
+    const char* filters[] = { "*.jpg","*.png","*.bmp","*.tif","*.jpeg" };
+    const char* path = tinyfd_openFileDialog("Open Image", "", 5, filters, "Image files", 0);
+    if (!path) return false;
+    Mat tmp = imread(path, IMREAD_UNCHANGED);
+    if (tmp.empty()) return false;
+    out = tmp;
+    imgProcessed = tmp.clone();
+
+    // Clear undo stack when loading new image
+    while (!undoStack.empty()) undoStack.pop();
+    updateHistogram();
+    return true;
+}
+
+//Save Image Function
+bool saveImageToDialog(const Mat& image) {
+    if (image.empty()) {
+        cout << "Error: No image to save" << endl;
+        return false;
+    }
+
+    const char* filters[] = { "*.png", "*.jpg", "*.bmp", "*.tif" };
+    const char* path = tinyfd_saveFileDialog("Save Image", "processed_image.png", 4, filters, "Image files");
+
+    if (!path) return false;
+
+    // Add file extension if not provided
+    string filePath = path;
+    if (filePath.find('.') == string::npos) {
+        filePath += ".png";
+    }
+
+    bool success = imwrite(filePath, image);
+    if (success) {
+        cout << "Image saved successfully: " << filePath << endl;
+    }
+    else {
+        cout << "Error: Failed to save image" << endl;
+    }
+    return success;
+}
+
+GLuint matToTexture(const Mat& mat, GLuint& texID) {
+    if (mat.empty()) return 0;
+
+    Mat imgRGBA;
+    if (mat.channels() == 1) cvtColor(mat, imgRGBA, COLOR_GRAY2RGBA);
+    else if (mat.channels() == 3) cvtColor(mat, imgRGBA, COLOR_BGR2RGBA);
+    else if (mat.channels() == 4) imgRGBA = mat.clone();
+    else return 0;
+
+    if (texID) glDeleteTextures(1, &texID);
+    glGenTextures(1, &texID);
+    glBindTexture(GL_TEXTURE_2D, texID);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, imgRGBA.cols, imgRGBA.rows, 0, GL_RGBA, GL_UNSIGNED_BYTE, imgRGBA.data);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    return texID;
+}
+
+// Min, Max, Median, Morphological Operations
+
+void fn_SmoothFilter() {
+    if (imgOriginal.empty()) {
+        cout << "Error: No image loaded for Smooth Filter" << endl;
+        return;
+    }
+    pushUndo();
+
+    Mat gray;
+    if (imgOriginal.channels() == 3 || imgOriginal.channels() == 4) {
+        cvtColor(imgOriginal, gray, COLOR_BGR2GRAY);
+    }
+    else {
+        gray = imgOriginal.clone();
+    }
+
+    Mat result = gray.clone();
+    int kernel_size = 3;
+    int offset = kernel_size / 2;
+
+    vector<uchar> pixelValues;
+    pixelValues.reserve(kernel_size * kernel_size);
+
+    for (int i = offset; i < gray.rows - offset; i++) {
+        for (int j = offset; j < gray.cols - offset; j++) {
+            pixelValues.clear();
+
+            for (int ki = -offset; ki <= offset; ki++) {
+                for (int kj = -offset; kj <= offset; kj++) {
+                    pixelValues.push_back(gray.at<uchar>(i + ki, j + kj));
+                }
+            }
+
+            sort(pixelValues.begin(), pixelValues.end());
+            result.at<uchar>(i, j) = pixelValues[0];
+        }
+    }
+
+    imgProcessed = result;
+    matToTexture(imgProcessed, texProcessed);
+    updateHistogram();
+    cout << "Smooth filter applied - Selects minimum value in 3x3 neighborhood" << endl;
+}
+
+// Max Filter Function
+void fn_MaxFilter() {
+    if (imgOriginal.empty()) {
+        cout << "Error: No image loaded for Max Filter" << endl;
+        return;
+    }
+    pushUndo();
+
+    Mat gray;
+    if (imgOriginal.channels() == 3 || imgOriginal.channels() == 4) {
+        cvtColor(imgOriginal, gray, COLOR_BGR2GRAY);
+    }
+    else {
+        gray = imgOriginal.clone();
+    }
+
+    Mat result = gray.clone();
+    int kernel_size = 3;
+    int offset = kernel_size / 2;
+
+    vector<uchar> pixelValues;
+    pixelValues.reserve(kernel_size * kernel_size);
+
+    for (int i = offset; i < gray.rows - offset; i++) {
+        for (int j = offset; j < gray.cols - offset; j++) {
+            pixelValues.clear();
+
+            for (int ki = -offset; ki <= offset; ki++) {
+                for (int kj = -offset; kj <= offset; kj++) {
+                    pixelValues.push_back(gray.at<uchar>(i + ki, j + kj));
+                }
+            }
+
+            sort(pixelValues.begin(), pixelValues.end());
+            result.at<uchar>(i, j) = pixelValues[pixelValues.size() - 1];
+        }
+    }
+
+    imgProcessed = result;
+    matToTexture(imgProcessed, texProcessed);
+    updateHistogram();
+    cout << "Max filter applied - Selects maximum value in 3x3 neighborhood" << endl;
+}
+
+// Median Filter Function
+void fn_MedianFilter() {
+    if (imgOriginal.empty()) {
+        cout << "Error: No image loaded for Median Filter" << endl;
+        return;
+    }
+    pushUndo();
+
+    Mat gray;
+    if (imgOriginal.channels() == 3 || imgOriginal.channels() == 4) {
+        cvtColor(imgOriginal, gray, COLOR_BGR2GRAY);
+    }
+    else {
+        gray = imgOriginal.clone();
+    }
+
+    Mat result = gray.clone();
+    int kernel_size = 3;
+    int offset = kernel_size / 2;
+
+    vector<uchar> pixelValues;
+    pixelValues.reserve(kernel_size * kernel_size);
+
+    for (int i = offset; i < gray.rows - offset; i++) {
+        for (int j = offset; j < gray.cols - offset; j++) {
+            pixelValues.clear();
+
+            for (int ki = -offset; ki <= offset; ki++) {
+                for (int kj = -offset; kj <= offset; kj++) {
+                    pixelValues.push_back(gray.at<uchar>(i + ki, j + kj));
+                }
+            }
+
+            sort(pixelValues.begin(), pixelValues.end());
+            result.at<uchar>(i, j) = pixelValues[pixelValues.size() / 2];
+        }
+    }
+
+    imgProcessed = result;
+    matToTexture(imgProcessed, texProcessed);
+    updateHistogram();
+    cout << "Median filter applied - Selects median value in 3x3 neighborhood (noise reduction)" << endl;
+}
+
+// Erosion Function
+void fn_Erosion() {
+    if (imgOriginal.empty()) {
+        cout << "Error: No image loaded for Erosion" << endl;
+        return;
+    }
+    pushUndo();
+
+    Mat gray;
+    if (imgOriginal.channels() == 3 || imgOriginal.channels() == 4) {
+        cvtColor(imgOriginal, gray, COLOR_BGR2GRAY);
+    }
+    else {
+        gray = imgOriginal.clone();
+    }
+
+    // Binarize the image
+    Mat binary = gray.clone();
+    for (int i = 0; i < binary.rows; i++) {
+        for (int j = 0; j < binary.cols; j++) {
+            binary.at<uchar>(i, j) = (binary.at<uchar>(i, j) > 128) ? 255 : 0;
+        }
+    }
+
+    // Create structuring element
+    Mat SE = Mat::ones(9, 9, CV_8U);
+
+    // Apply erosion
+    Mat eroded;
+    erode(binary, eroded, SE);
+
+    imgProcessed = eroded;
+    matToTexture(imgProcessed, texProcessed);
+    updateHistogram();
+    cout << "Erosion applied - Shrinks white regions, expands black regions" << endl;
+}
+
+// Dilation Function
+void fn_Dilation() {
+    if (imgOriginal.empty()) {
+        cout << "Error: No image loaded for Dilation" << endl;
+        return;
+    }
+    pushUndo();
+
+    Mat gray;
+    if (imgOriginal.channels() == 3 || imgOriginal.channels() == 4) {
+        cvtColor(imgOriginal, gray, COLOR_BGR2GRAY);
+    }
+    else {
+        gray = imgOriginal.clone();
+    }
+
+    // Binarize the image
+    Mat binary = gray.clone();
+    for (int i = 0; i < binary.rows; i++) {
+        for (int j = 0; j < binary.cols; j++) {
+            binary.at<uchar>(i, j) = (binary.at<uchar>(i, j) > 128) ? 255 : 0;
+        }
+    }
+
+    // Create structuring element
+    Mat SE = Mat::ones(9, 9, CV_8U);
+
+    // Apply dilation
+    Mat dilated;
+    dilate(binary, dilated, SE);
+
+    imgProcessed = dilated;
+    matToTexture(imgProcessed, texProcessed);
+    updateHistogram();
+    cout << "Dilation applied - Expands white regions, shrinks black regions" << endl;
+}
+
+// Opening Function (Erosion followed by Dilation)
+void fn_Opening() {
+    if (imgOriginal.empty()) {
+        cout << "Error: No image loaded for Opening" << endl;
+        return;
+    }
+    pushUndo();
+
+    Mat gray;
+    if (imgOriginal.channels() == 3 || imgOriginal.channels() == 4) {
+        cvtColor(imgOriginal, gray, COLOR_BGR2GRAY);
+    }
+    else {
+        gray = imgOriginal.clone();
+    }
+
+    // Binarize the image
+    Mat binary = gray.clone();
+    for (int i = 0; i < binary.rows; i++) {
+        for (int j = 0; j < binary.cols; j++) {
+            binary.at<uchar>(i, j) = (binary.at<uchar>(i, j) > 128) ? 255 : 0;
+        }
+    }
+
+    // Create structuring element
+    Mat SE = Mat::ones(9, 9, CV_8U);
+
+    // Apply opening (erosion then dilation)
+    Mat temp, opened;
+    erode(binary, temp, SE);
+    dilate(temp, opened, SE);
+
+    imgProcessed = opened;
+    matToTexture(imgProcessed, texProcessed);
+    updateHistogram();
+    cout << "Opening applied (Erosion + Dilation) - Removes small white noise, smooths contours" << endl;
+}
+
+// Closing Function (Dilation followed by Erosion)
+void fn_Closing() {
+    if (imgOriginal.empty()) {
+        cout << "Error: No image loaded for Closing" << endl;
+        return;
+    }
+    pushUndo();
+
+    Mat gray;
+    if (imgOriginal.channels() == 3 || imgOriginal.channels() == 4) {
+        cvtColor(imgOriginal, gray, COLOR_BGR2GRAY);
+    }
+    else {
+        gray = imgOriginal.clone();
+    }
+
+    // Binarize the image
+    Mat binary = gray.clone();
+    for (int i = 0; i < binary.rows; i++) {
+        for (int j = 0; j < binary.cols; j++) {
+            binary.at<uchar>(i, j) = (binary.at<uchar>(i, j) > 128) ? 255 : 0;
+        }
+    }
+
+    // Create structuring element
+    Mat SE = Mat::ones(9, 9, CV_8U);
+
+    // Apply closing (dilation then erosion)
+    Mat temp, closed;
+    dilate(binary, temp, SE);
+    erode(temp, closed, SE);
+
+    imgProcessed = closed;
+    matToTexture(imgProcessed, texProcessed);
+    updateHistogram();
+    cout << "Closing applied (Dilation + Erosion) - Fills small black holes, smooths contours" << endl;
+}
+
+// DFT Functions 
+void updateDFTFilter() {
+    if (dftGray.empty()) return;
+
+    int m = getOptimalDFTSize(dftGray.rows);
+    int n = getOptimalDFTSize(dftGray.cols);
+
+    Mat padded;
+    copyMakeBorder(dftGray, padded, 0, m - dftGray.rows, 0, n - dftGray.cols,
+        BORDER_CONSTANT, Scalar::all(0));
+
+    Mat planes[] = { Mat_<float>(padded), Mat::zeros(padded.size(), CV_32F) };
+    Mat complexI;
+    merge(planes, 2, complexI);
+
+    dft(complexI, complexI);
+
+    split(complexI, planes);
+
+    Mat magnitudeBefore;
+    magnitude(planes[0], planes[1], magnitudeBefore);
+    magnitudeBefore += Scalar::all(1);
+    log(magnitudeBefore, magnitudeBefore);
+    normalize(magnitudeBefore, magnitudeBefore, 0, 1, NORM_MINMAX);
+
+    Mat displayBefore;
+    magnitudeBefore.convertTo(displayBefore, CV_8UC1, 255.0);
+    matToTexture(displayBefore, texDFTBefore);
+
+    int cx = padded.cols / 2;
+    int cy = padded.rows / 2;
+
+    Mat q0(planes[0], Rect(0, 0, cx, cy));
+    Mat q1(planes[0], Rect(cx, 0, cx, cy));
+    Mat q2(planes[0], Rect(0, cy, cx, cy));
+    Mat q3(planes[0], Rect(cx, cy, cx, cy));
+
+    Mat temp;
+    q0.copyTo(temp);
+    q3.copyTo(q0);
+    temp.copyTo(q3);
+
+    q1.copyTo(temp);
+    q2.copyTo(q1);
+    temp.copyTo(q2);
+
+    q0 = Mat(planes[1], Rect(0, 0, cx, cy));
+    q1 = Mat(planes[1], Rect(cx, 0, cx, cy));
+    q2 = Mat(planes[1], Rect(0, cy, cx, cy));
+    q3 = Mat(planes[1], Rect(cx, cy, cx, cy));
+
+    q0.copyTo(temp);
+    q3.copyTo(q0);
+    temp.copyTo(q3);
+
+    q1.copyTo(temp);
+    q2.copyTo(q1);
+    temp.copyTo(q2);
+
+    Mat magnitudeAfter;
+    magnitude(planes[0], planes[1], magnitudeAfter);
+    magnitudeAfter += Scalar::all(1);
+    log(magnitudeAfter, magnitudeAfter);
+    normalize(magnitudeAfter, magnitudeAfter, 0, 1, NORM_MINMAX);
+
+    Mat displayAfter;
+    magnitudeAfter.convertTo(displayAfter, CV_8UC1, 255.0);
+    matToTexture(displayAfter, texDFTAfter);
+
+    Mat Lfilter = Mat::zeros(padded.size(), CV_32F);
+    Point center = Point(padded.cols / 2, padded.rows / 2);
+
+    for (int i = 0; i < padded.rows; i++) {
+        for (int j = 0; j < padded.cols; j++) {
+            double distance = sqrt(pow(i - center.y, 2) + pow(j - center.x, 2));
+            if (distance <= dftCutoff) {
+                Lfilter.at<float>(i, j) = 1.0f;
+            }
+        }
+    }
+
+    Mat outR, outI;
+    multiply(planes[0], Lfilter, outR);
+    multiply(planes[1], Lfilter, outI);
+
+    q0 = Mat(outR, Rect(0, 0, cx, cy));
+    q1 = Mat(outR, Rect(cx, 0, cx, cy));
+    q2 = Mat(outR, Rect(0, cy, cx, cy));
+    q3 = Mat(outR, Rect(cx, cy, cx, cy));
+
+    q0.copyTo(temp);
+    q3.copyTo(q0);
+    temp.copyTo(q3);
+
+    q1.copyTo(temp);
+    q2.copyTo(q1);
+    temp.copyTo(q2);
+
+    q0 = Mat(outI, Rect(0, 0, cx, cy));
+    q1 = Mat(outI, Rect(cx, 0, cx, cy));
+    q2 = Mat(outI, Rect(0, cy, cx, cy));
+    q3 = Mat(outI, Rect(cx, cy, cx, cy));
+
+    q0.copyTo(temp);
+    q3.copyTo(q0);
+    temp.copyTo(q3);
+
+    q1.copyTo(temp);
+    q2.copyTo(q1);
+    temp.copyTo(q2);
+
+    Mat outPlanes[] = { outR, outI };
+    Mat outComplexI;
+    merge(outPlanes, 2, outComplexI);
+
+    Mat idftResult;
+    idft(outComplexI, idftResult, DFT_SCALE | DFT_REAL_OUTPUT);
+
+    Mat resultPlanes[2];
+    split(idftResult, resultPlanes);
+    Mat out = resultPlanes[0];
+
+    normalize(out, out, 0, 1, NORM_MINMAX);
+    Mat cropped = out(Rect(0, 0, dftGray.cols, dftGray.rows));
+    cropped.convertTo(dftFiltered, CV_8U, 255.0);
+
+    dftProcessed = true;
+    matToTexture(dftFiltered, texDFTFiltered);
+
+    cout << "DFT Low-Pass Filter applied with cutoff D0 = " << dftCutoff << endl;
+}
+
+void fn_DFTLowPassFilter() {
+    if (imgOriginal.empty()) {
+        cout << "Error: No image loaded for DFT Low-Pass Filter" << endl;
+        return;
+    }
+
+    pushUndo();
+
+    if (imgOriginal.channels() == 3 || imgOriginal.channels() == 4) {
+        cvtColor(imgOriginal, dftGray, COLOR_BGR2GRAY);
+    }
+    else {
+        dftGray = imgOriginal.clone();
+    }
+
+    dftOriginal = dftGray.clone();
+
+    dftCutoff = 30;
+    dftProcessed = false;
+
+    showDFTWindow = true;
+
+    updateDFTFilter();
+    updateHistogram();
+    cout << "DFT Low-Pass Filter activated - Integrated in main window" << endl;
+}
+
+// Edge Detection Segmentation Functions
+void updateEdgeSegmentation() {
+    if (imgOriginal.empty()) return;
+
+    Mat gray;
+    if (imgOriginal.channels() == 3 || imgOriginal.channels() == 4) {
+        cvtColor(imgOriginal, gray, COLOR_BGR2GRAY);
+    }
+    else {
+        gray = imgOriginal.clone();
+    }
+
+    // Region-based segmentation (Laplacian of Gaussian)
+    Mat kernel_LOG = (Mat_<float>(5, 5) <<
+        0, 0, -1, 0, 0,
+        0, -1, -2, -1, 0,
+        -1, -2, 16, -2, -1,
+        0, -1, -2, -1, 0,
+        0, 0, -1, 0, 0);
+
+    filter2D(gray, regionSegResult, CV_8UC1, kernel_LOG);
+    normalize(regionSegResult, regionSegResult, 0, 255, NORM_MINMAX, CV_8U);
+
+    // Threshold-based segmentation
+    edgeSegResult = Mat(gray.size(), CV_8UC1);
+
+    for (int r = 0; r < gray.rows; r++) {
+        for (int c = 0; c < gray.cols; c++) {
+            if (gray.at<uchar>(r, c) > edgeThreshold)
+                edgeSegResult.at<uchar>(r, c) = 255;
+            else
+                edgeSegResult.at<uchar>(r, c) = 0;
+        }
+    }
+
+    matToTexture(regionSegResult, texRegionSeg);
+    matToTexture(edgeSegResult, texEdgeSeg);
+}
+
+void fn_EdgeDetectionSegmentation() {
+    if (imgOriginal.empty()) {
+        cout << "Error: No image loaded for Edge Detection Segmentation" << endl;
+        return;
+    }
+
+    pushUndo();
+
+    edgeThreshold = 100;
+    showEdgeSegWindow = true;
+
+    updateEdgeSegmentation();
+    updateHistogram();
+    cout << "Edge Detection Segmentation activated" << endl;
+}
+
+// Histogram Analysis Function 
+void fn_HistogramAnalysis() {
+    if (imgOriginal.empty()) {
+        cout << "Error: No image loaded for Histogram Analysis" << endl;
+        return;
+    }
+
+    Mat gray;
+    if (imgOriginal.channels() == 3 || imgOriginal.channels() == 4) {
+        cvtColor(imgOriginal, gray, COLOR_BGR2GRAY);
+    }
+    else {
+        gray = imgOriginal.clone();
+    }
+
+    float hist[256] = { 0 };
+    cout << "HISTOGRAM ANALYSIS" << endl;
+    cout << "Total No. of pixels: " << gray.total() << endl;
+    cout << "Non-Zero pixel intensities and its count:" << endl;
+
+    for (int i = 0; i < 256; i++) {
+        for (int r = 0; r < gray.rows; r++) {
+            for (int c = 0; c < gray.cols; c++) {
+                if (gray.at<uchar>(r, c) == i)
+                    hist[i] += 1;
+            }
+        }
+        if (hist[i] != 0)
+            cout << "hist[" << i << "] = " << hist[i] << endl;
+    }
+
+    // Create histogram image
+    histogramImage = Mat(200, 512, CV_8UC3, Scalar(255, 255, 255));
+
+    float max_val = 0;
+    for (int i = 0; i < 256; i++) {
+        if (hist[i] > max_val) max_val = hist[i];
+    }
+
+    for (int s = 0; s < 256; s++) {
+        int bin_height = cvRound(hist[s] * 200 / max_val);
+        line(histogramImage, Point(s * 2, 200), Point(s * 2, 200 - bin_height),
+            Scalar(0, 0, 255), 2);
+    }
+
+    // Add axes
+    line(histogramImage, Point(0, 0), Point(0, 200), Scalar(0, 0, 0), 2);
+    line(histogramImage, Point(0, 200), Point(512, 200), Scalar(0, 0, 0), 2);
+
+    matToTexture(histogramImage, texHistogram);
+    updateHistogram();
+    cout << "Histogram analysis completed - Visual histogram displayed" << endl;
+}
+// Function to update histogram automatically
+void updateHistogram() {
+    if (imgProcessed.empty()) return;
+
+    Mat gray;
+    if (imgProcessed.channels() == 3 || imgProcessed.channels() == 4) {
+        cvtColor(imgProcessed, gray, COLOR_BGR2GRAY);
+    }
+    else if (imgProcessed.channels() == 1) {
+        gray = imgProcessed.clone();
+    }
+    else {
+        return;
+    }
+
+    // Calculate histogram
+    float hist[256] = { 0 };
+
+    for (int r = 0; r < gray.rows; r++) {
+        for (int c = 0; c < gray.cols; c++) {
+            int intensity = gray.at<uchar>(r, c);
+            hist[intensity]++;
+        }
+    }
+
+    // Create histogram image
+    histogramImage = Mat(200, 512, CV_8UC3, Scalar(255, 255, 255));
+
+    float max_val = 0;
+    for (int i = 0; i < 256; i++) {
+        if (hist[i] > max_val) max_val = hist[i];
+    }
+
+    for (int s = 0; s < 256; s++) {
+        int bin_height = cvRound(hist[s] * 200 / max_val);
+        line(histogramImage, Point(s * 2, 200), Point(s * 2, 200 - bin_height),
+            Scalar(0, 0, 255), 2);
+    }
+
+    // Add axes
+    line(histogramImage, Point(0, 0), Point(0, 200), Scalar(0, 0, 0), 2);
+    line(histogramImage, Point(0, 200), Point(512, 200), Scalar(0, 0, 0), 2);
+
+    matToTexture(histogramImage, texHistogram);
+
+    // Print histogram info to console
+    cout << "AUTO HISTOGRAM UPDATE" << endl;
+    cout << "Image Size: " << gray.cols << " x " << gray.rows << endl;
+    cout << "Total Pixels: " << gray.total() << endl;
+
+    // Find min and max intensity values
+    int min_intensity = 255, max_intensity = 0;
+    for (int i = 0; i < 256; i++) {
+        if (hist[i] > 0) {
+            if (i < min_intensity) min_intensity = i;
+            if (i > max_intensity) max_intensity = i;
+        }
+    }
+    cout << "Intensity Range: " << min_intensity << " - " << max_intensity << endl;
+
+    double mean_intensity = 0;
+    for (int i = 0; i < 256; i++) {
+        mean_intensity += i * (hist[i] / gray.total());
+    }
+    cout << "Mean Intensity: " << mean_intensity << endl;
+    // Force redraw of histogram display
+    if (texHistogram != 0) {
+        cout << "Histogram updated and displayed" << endl;
+    }
+}
+// Histogram Equalization Function 
+void fn_HistogramEqualization() {
+    if (imgOriginal.empty()) {
+        cout << "Error: No image loaded for Histogram Equalization" << endl;
+        return;
+    }
+    pushUndo();
+
+    Mat gray;
+    if (imgOriginal.channels() == 3 || imgOriginal.channels() == 4) {
+        cvtColor(imgOriginal, gray, COLOR_BGR2GRAY);
+    }
+    else {
+        gray = imgOriginal.clone();
+    }
+
+    equalizeHist(gray, imgProcessed);
+    matToTexture(imgProcessed, texProcessed);
+    updateHistogram();
+    cout << "Histogram Equalization applied - Enhances image contrast" << endl;
+}
+
+//Object Detection Function 
+void fn_ObjectDetection() {
+    if (imgOriginal.empty()) {
+        cout << "Error: No image loaded for Object Detection" << endl;
+        return;
+    }
+    pushUndo();
+
+    Mat gray;
+    if (imgOriginal.channels() == 3 || imgOriginal.channels() == 4) {
+        cvtColor(imgOriginal, gray, COLOR_BGR2GRAY);
+    }
+    else {
+        gray = imgOriginal.clone();
+    }
+
+    imgProcessed = gray.clone();
+
+    for (int r = 0; r < gray.rows; r++) {
+        for (int c = 0; c < gray.cols; c++) {
+            if (gray.at<uchar>(r, c) >= 150)
+                imgProcessed.at<uchar>(r, c) = 255;
+            else
+                imgProcessed.at<uchar>(r, c) = gray.at<uchar>(r, c);
+        }
+    }
+
+    matToTexture(imgProcessed, texProcessed);
+    updateHistogram();
+    cout << "Object detection applied - Highlights bright objects (threshold: 150)" << endl;
+}
+
+//Basic Operations - FIXED: Preserves grayscale format
+void fn_RGB_to_Gray() {
+    if (imgOriginal.empty()) {
+        cout << "Error: No image loaded for RGB to Gray conversion" << endl;
+        return;
+    }
+    pushUndo();
+
+    if (imgOriginal.channels() == 3 || imgOriginal.channels() == 4) {
+        cvtColor(imgOriginal, imgProcessed, COLOR_BGR2GRAY);
+    }
+    else if (imgOriginal.channels() == 1) {
+        // Already grayscale, just clone
+        imgProcessed = imgOriginal.clone();
+    }
+
+    matToTexture(imgProcessed, texProcessed);
+    updateHistogram();
+    cout << "RGB to Gray conversion completed - Image is now grayscale (1 channel)" << endl;
+}
+
+void fn_Image_Info() {
+    showImageInfo = true;
+    if (!imgOriginal.empty()) {
+        cout << "ORIGINAL IMAGE INFO" << endl;
+        cout << " - Dimensions: " << imgOriginal.cols << " x " << imgOriginal.rows << endl;
+        cout << " - Channels: " << imgOriginal.channels() << endl;
+        cout << " - Type: " << imgOriginal.type() << endl;
+
+        if (!imgProcessed.empty() && imgProcessed.channels() == 1) {
+            cout << "GRAYSCALE IMAGE INFO " << endl;
+            cout << " - Dimensions: " << imgProcessed.cols << " x " << imgProcessed.rows << endl;
+            cout << " - Channels: " << imgProcessed.channels() << " (Grayscale)" << endl;
+            cout << " - Type: " << imgProcessed.type() << endl;
+
+            // Calculate grayscale statistics
+            double minVal, maxVal;
+            minMaxLoc(imgProcessed, &minVal, &maxVal);
+
+            cout << " - Min Intensity: " << minVal << endl;
+            cout << " - Max Intensity: " << maxVal << endl;
+            cout << " - Dynamic Range: " << (maxVal - minVal) << endl;
+        }
+    }
+}
+
+void fn_Min_Max() {
+    if (imgOriginal.empty()) {
+        cout << "Error: No image loaded for Min-Max calculation" << endl;
+        return;
+    }
+    double minVal, maxVal;
+    minMaxLoc(imgOriginal, &minVal, &maxVal);
+    cout << "Min Value: " << minVal << ", Max Value: " << maxVal << endl;
+}
+
+//Geometric Transform
+void fn_Translation(float tx = 50, float ty = 50) {
+    if (imgOriginal.empty()) {
+        cout << "Error: No image loaded for Translation" << endl;
+        return;
+    }
+    pushUndo();
+    Mat TM = (Mat_<float>(2, 3) << 1, 0, tx, 0, 1, ty);
+    warpAffine(imgOriginal, imgProcessed, TM, imgOriginal.size());
+    matToTexture(imgProcessed, texProcessed);
+    cout << "Translation applied - X: " << tx << ", Y: " << ty << endl;
+}
+
+void fn_Rotation(float angle = 90) {
+    if (imgOriginal.empty()) {
+        cout << "Error: No image loaded for Rotation" << endl;
+        return;
+    }
+    pushUndo();
+    Point2f center(imgOriginal.cols / 2.0f, imgOriginal.rows / 2.0f);
+    Mat R = getRotationMatrix2D(center, angle, 1.0);
+    warpAffine(imgOriginal, imgProcessed, R, imgOriginal.size());
+    matToTexture(imgProcessed, texProcessed);
+    cout << "Rotation applied - Angle: " << angle << " degrees" << endl;
+}
+
+void fn_FlipX() {
+    if (imgOriginal.empty()) {
+        cout << "Error: No image loaded for Flip X" << endl;
+        return;
+    }
+    pushUndo();
+    flip(imgOriginal, imgProcessed, 1);
+    matToTexture(imgProcessed, texProcessed);
+    cout << "Horizontal flip applied" << endl;
+}
+
+void fn_FlipY() {
+    if (imgOriginal.empty()) {
+        cout << "Error: No image loaded for Flip Y" << endl;
+        return;
+    }
+    pushUndo();
+    flip(imgOriginal, imgProcessed, 0);
+    matToTexture(imgProcessed, texProcessed);
+    cout << "Vertical flip applied" << endl;
+}
+
+void fn_FlipXY() {
+    if (imgOriginal.empty()) {
+        cout << "Error: No image loaded for Flip XY" << endl;
+        return;
+    }
+    pushUndo();
+    flip(imgOriginal, imgProcessed, -1);
+    matToTexture(imgProcessed, texProcessed);
+    cout << "Both horizontal and vertical flip applied" << endl;
+}
+
+void fn_Zoom(float scale = 2.0f) {
+    if (imgOriginal.empty()) {
+        cout << "Error: No image loaded for Zoom" << endl;
+        return;
+    }
+    pushUndo();
+    Size newSize(imgOriginal.cols * scale, imgOriginal.rows * scale);
+    resize(imgOriginal, imgProcessed, newSize, 0, 0, INTER_LINEAR);
+    matToTexture(imgProcessed, texProcessed);
+    cout << "Zoom applied - Scale: " << scale << "x" << endl;
+}
+
+//Skew 
+void fn_Skew(float skewX = 50, float skewY = 0) {
+    if (imgOriginal.empty()) {
+        cout << "Error: No image loaded for Skew" << endl;
+        return;
+    }
+    pushUndo();
+    Point2f srcTri[3];
+    Point2f dstTri[3];
+
+    srcTri[0] = Point2f(0, 0);
+    srcTri[1] = Point2f(imgOriginal.cols - 1, 0);
+    srcTri[2] = Point2f(0, imgOriginal.rows - 1);
+
+    dstTri[0] = Point2f(0, 0);
+    dstTri[1] = Point2f(imgOriginal.cols - 1, 0);
+    dstTri[2] = Point2f(skewX, imgOriginal.rows - 1 + skewY);
+
+    Mat warpMat = getAffineTransform(srcTri, dstTri);
+    warpAffine(imgOriginal, imgProcessed, warpMat, imgOriginal.size());
+    matToTexture(imgProcessed, texProcessed);
+    cout << "Skew transformation applied - X: " << skewX << ", Y: " << skewY << endl;
+}
+
+//Image Enhancement
+void fn_Negative() {
+    if (imgOriginal.empty()) {
+        cout << "Error: No image loaded for Negative" << endl;
+        return;
+    }
+
+    pushUndo();
+
+    Mat src = imgProcessed.empty() ? imgOriginal : imgProcessed;
+    Mat gray;
+
+    // Convert to grayscale exactly like imread(..., 0)
+    if (src.channels() == 3)
+        cvtColor(src, gray, COLOR_BGR2GRAY);
+    else if (src.channels() == 4)
+        cvtColor(src, gray, COLOR_BGRA2GRAY);
+    else
+        gray = src.clone();
+
+    // Pixel-by-pixel Negative (same as your code)
+    for (int i = 0; i < gray.rows; i++) {
+        for (int j = 0; j < gray.cols; j++) {
+            gray.at<uchar>(i, j) = 255 - gray.at<uchar>(i, j);
+        }
+    }
+
+    imgProcessed = gray.clone();
+    matToTexture(imgProcessed, texProcessed);
+    updateHistogram();
+    cout << "Negative applied using pixel-wise grayscale method" << endl;
+}
+
+void fn_LogTransform() {
+    if (imgOriginal.empty()) {
+        cout << "Error: No image loaded for Log Transform" << endl;
+        return;
+    }
+
+    pushUndo();
+
+    Mat src = imgProcessed.empty() ? imgOriginal : imgProcessed;
+    Mat gray;
+
+    // Convert to grayscale
+    if (src.channels() == 3)
+        cvtColor(src, gray, COLOR_BGR2GRAY);
+    else if (src.channels() == 4)
+        cvtColor(src, gray, COLOR_BGRA2GRAY);
+    else
+        gray = src.clone();
+
+    Mat dst(gray.rows, gray.cols, CV_32FC1);
+
+    // Pixel-by-pixel Log transform
+    for (int i = 0; i < gray.rows; i++) {
+        for (int j = 0; j < gray.cols; j++) {
+            dst.at<float>(i, j) = log(gray.at<uchar>(i, j) + 1.0f);
+        }
+    }
+
+    normalize(dst, dst, 0, 255, NORM_MINMAX);
+    convertScaleAbs(dst, imgProcessed);
+
+    matToTexture(imgProcessed, texProcessed);
+    updateHistogram();
+    cout << "Log transform applied using pixel-wise grayscale method" << endl;
+}
+
+void fn_GammaCorrection(float gamma = 1.5f) {
+    if (imgOriginal.empty()) {
+        cout << "Error: No image loaded for Gamma Correction" << endl;
+        return;
+    }
+    pushUndo();
+
+    if (imgOriginal.channels() == 3) {
+        vector<Mat> channels;
+        split(imgOriginal, channels);
+
+        for (int i = 0; i < 3; i++) {
+            Mat floatChannel;
+            channels[i].convertTo(floatChannel, CV_32F);
+            floatChannel /= 255.0;
+            pow(floatChannel, gamma, floatChannel);
+            floatChannel *= 255.0;
+            floatChannel.convertTo(channels[i], CV_8U);
+        }
+        merge(channels, imgProcessed);
+    }
+    else if (imgOriginal.channels() == 4) {
+        vector<Mat> channels;
+        split(imgOriginal, channels);
+
+        for (int i = 0; i < 3; i++) {
+            Mat floatChannel;
+            channels[i].convertTo(floatChannel, CV_32F);
+            floatChannel /= 255.0;
+            pow(floatChannel, gamma, floatChannel);
+            floatChannel *= 255.0;
+            floatChannel.convertTo(channels[i], CV_8U);
+        }
+        merge(channels, imgProcessed);
+    }
+    else {
+        Mat floatImage;
+        imgOriginal.convertTo(floatImage, CV_32F);
+        floatImage /= 255.0;
+        pow(floatImage, gamma, floatImage);
+        floatImage *= 255.0;
+        floatImage.convertTo(imgProcessed, CV_8U);
+    }
+
+    matToTexture(imgProcessed, texProcessed);
+    updateHistogram();
+    cout << "Gamma correction applied - Gamma: " << gamma << " (Brightness adjustment)" << endl;
+}
+
+void fn_BitPlaneSlicing(int bitplane = 6) {
+    if (imgOriginal.empty()) {
+        cout << "Error: No image loaded for Bit Plane Slicing" << endl;
+        return;
+    }
+    pushUndo();
+
+    Mat gray;
+    if (imgOriginal.channels() == 3 || imgOriginal.channels() == 4) {
+        cvtColor(imgOriginal, gray, COLOR_BGR2GRAY);
+    }
+    else {
+        gray = imgOriginal.clone();
+    }
+
+    Mat out = Mat::zeros(gray.size(), CV_8U);
+    for (int i = 0; i < gray.rows; i++) {
+        for (int j = 0; j < gray.cols; j++) {
+            out.at<uchar>(i, j) = (gray.at<uchar>(i, j) & (1 << bitplane)) ? 255 : 0;
+        }
+    }
+    imgProcessed = out;
+    matToTexture(imgProcessed, texProcessed);
+    updateHistogram();
+    cout << "Bit plane slicing applied - Bit plane: " << bitplane << " (Shows specific bit level)" << endl;
+}
+
+void fn_BitPlaneSlicingEnhanced() {
+    if (imgOriginal.empty()) {
+        cout << "Error: No image loaded for Enhanced Bit Plane Slicing" << endl;
+        return;
+    }
+    pushUndo();
+
+    Mat gray;
+    if (imgOriginal.channels() == 3 || imgOriginal.channels() == 4) {
+        cvtColor(imgOriginal, gray, COLOR_BGR2GRAY);
+    }
+    else {
+        gray = imgOriginal.clone();
+    }
+
+    Mat result = Mat::zeros(gray.size(), CV_8U);
+
+    for (int bit = 4; bit < 8; bit++) {
+        for (int i = 0; i < gray.rows; i++) {
+            for (int j = 0; j < gray.cols; j++) {
+                if (gray.at<uchar>(i, j) & (1 << bit)) {
+                    result.at<uchar>(i, j) += (1 << (bit - 2));
+                }
+            }
+        }
+    }
+
+    imgProcessed = result;
+    matToTexture(imgProcessed, texProcessed);
+    updateHistogram();
+    cout << "Enhanced Bit plane slicing applied - Shows multiple bit levels" << endl;
+}
+
+void fn_GrayLevelSlicing(int lower = 100, int upper = 200) {
+    if (imgOriginal.empty()) {
+        cout << "Error: No image loaded for Gray Level Slicing" << endl;
+        return;
+    }
+    pushUndo();
+
+    Mat gray;
+    if (imgOriginal.channels() == 3 || imgOriginal.channels() == 4) {
+        cvtColor(imgOriginal, gray, COLOR_BGR2GRAY);
+    }
+    else {
+        gray = imgOriginal.clone();
+    }
+
+    Mat out = Mat::zeros(gray.size(), CV_8U);
+    for (int i = 0; i < gray.rows; i++) {
+        for (int j = 0; j < gray.cols; j++) {
+            uchar pixel = gray.at<uchar>(i, j);
+            if (pixel >= lower && pixel <= upper) {
+                out.at<uchar>(i, j) = 255;
+            }
+            else {
+                out.at<uchar>(i, j) = pixel / 4;
+            }
+        }
+    }
+    imgProcessed = out;
+    matToTexture(imgProcessed, texProcessed);
+    updateHistogram();
+    cout << "Gray level slicing applied - Range: " << lower << " to " << upper << " (Highlights specific intensity range)" << endl;
+}
+
+void fn_RGB_to_Gray_Enhanced() {
+    if (imgOriginal.empty()) {
+        cout << "Error: No image loaded for RGB to Gray conversion" << endl;
+        return;
+    }
+    pushUndo();
+
+    if (imgOriginal.channels() == 3 || imgOriginal.channels() == 4) {
+        cvtColor(imgOriginal, imgProcessed, COLOR_BGR2GRAY);
+    }
+    else {
+        imgProcessed = imgOriginal.clone();
+    }
+
+    matToTexture(imgProcessed, texProcessed);
+    updateHistogram();
+    cout << "RGB to Gray conversion completed - Supports all image types" << endl;
+}
+
+//Filters
+void fn_TraditionalFilter() {
+    if (imgOriginal.empty()) {
+        cout << "Error: No image loaded for Traditional Filter" << endl;
+        return;
+    }
+    pushUndo();
+    Mat gray;
+    if (imgOriginal.channels() == 3) {
+        cvtColor(imgOriginal, gray, COLOR_BGR2GRAY);
+    }
+    else {
+        gray = imgOriginal.clone();
+    }
+
+    Mat kernel = Mat::ones(3, 3, CV_32F) / 9.0f;
+    filter2D(gray, imgProcessed, CV_8U, kernel);
+    matToTexture(imgProcessed, texProcessed);
+    updateHistogram();
+    cout << "Traditional 3x3 averaging filter applied" << endl;
+}
+
+void fn_PyramidalFilter() {
+    if (imgOriginal.empty()) {
+        cout << "Error: No image loaded for Pyramidal Filter" << endl;
+        return;
+    }
+    pushUndo();
+    Mat gray;
+    if (imgOriginal.channels() == 3) {
+        cvtColor(imgOriginal, gray, COLOR_BGR2GRAY);
+    }
+    else {
+        gray = imgOriginal.clone();
+    }
+
+    Mat kernel = (Mat_<float>(5, 5) <<
+        1, 2, 3, 2, 1,
+        2, 4, 6, 4, 2,
+        3, 6, 9, 6, 3,
+        2, 4, 6, 4, 2,
+        1, 2, 3, 2, 1) / 81.0f;
+    filter2D(gray, imgProcessed, CV_8U, kernel);
+    matToTexture(imgProcessed, texProcessed);
+    updateHistogram();
+    cout << "Pyramidal filter applied" << endl;
+}
+
+void fn_CircularFilter() {
+    if (imgOriginal.empty()) {
+        cout << "Error: No image loaded for Circular Filter" << endl;
+        return;
+    }
+    pushUndo();
+    Mat gray;
+    if (imgOriginal.channels() == 3) {
+        cvtColor(imgOriginal, gray, COLOR_BGR2GRAY);
+    }
+    else {
+        gray = imgOriginal.clone();
+    }
+
+    Mat kernel = (Mat_<float>(5, 5) <<
+        0, 1, 1, 1, 0,
+        1, 1, 1, 1, 1,
+        1, 1, 1, 1, 1,
+        1, 1, 1, 1, 1,
+        0, 1, 1, 1, 0) / 21.0f;
+    filter2D(gray, imgProcessed, CV_8U, kernel);
+    matToTexture(imgProcessed, texProcessed);
+    updateHistogram();
+    cout << "Circular filter applied" << endl;
+}
+
+void fn_ConeFilter() {
+    if (imgOriginal.empty()) {
+        cout << "Error: No image loaded for Cone Filter" << endl;
+        return;
+    }
+    pushUndo();
+    Mat gray;
+    if (imgOriginal.channels() == 3) {
+        cvtColor(imgOriginal, gray, COLOR_BGR2GRAY);
+    }
+    else {
+        gray = imgOriginal.clone();
+    }
+
+    Mat kernel = (Mat_<float>(5, 5) <<
+        0, 0, 1, 0, 0,
+        0, 2, 2, 2, 0,
+        1, 2, 5, 2, 1,
+        0, 2, 2, 2, 0,
+        0, 0, 1, 0, 0) / 25.0f;
+    filter2D(gray, imgProcessed, CV_8U, kernel);
+    matToTexture(imgProcessed, texProcessed);
+    updateHistogram();
+    cout << "Cone filter applied" << endl;
+}
+
+//Edge Detection Filters
+void fn_LaplacianFilter() {
+    if (imgOriginal.empty()) {
+        cout << "Error: No image loaded for Laplacian Filter" << endl;
+        return;
+    }
+    pushUndo();
+
+    Mat gray;
+    if (imgOriginal.channels() == 3 || imgOriginal.channels() == 4) {
+        cvtColor(imgOriginal, gray, COLOR_BGR2GRAY);
+    }
+    else {
+        gray = imgOriginal.clone();
+    }
+
+    // Laplacian filter kernel
+    Mat kernel_L = (Mat_<int>(3, 3) << 1, 1, 1, 1, -8, 1, 1, 1, 1);
+    filter2D(gray, imgProcessed, CV_8UC1, kernel_L);
+    normalize(imgProcessed, imgProcessed, 0, 255, NORM_MINMAX, CV_8U);
+    matToTexture(imgProcessed, texProcessed);
+    updateHistogram();
+    cout << "Laplacian filter applied - Edge detection" << endl;
+}
+
+void fn_SobelFilter() {
+    if (imgOriginal.empty()) {
+        cout << "Error: No image loaded for Sobel Filter" << endl;
+        return;
+    }
+    pushUndo();
+
+    Mat gray;
+    if (imgOriginal.channels() == 3 || imgOriginal.channels() == 4) {
+        cvtColor(imgOriginal, gray, COLOR_BGR2GRAY);
+    }
+    else {
+        gray = imgOriginal.clone();
+    }
+
+    // Sobel kernels for horizontal, vertical, and diagonal edges
+    Mat kernel_TH = (Mat_<int>(3, 3) << -1, -2, -1, 0, 0, 0, 1, 2, 1);
+    Mat kernel_TV = (Mat_<int>(3, 3) << -1, 0, 1, -2, 0, 2, -1, 0, 1);
+    Mat kernel_Td = (Mat_<int>(3, 3) << -2, 1, 0, 1, 0, -1, 0, -1, -2);
+
+    Mat dstS_H, dstS_V, dstS_D, dst_HV, dst_S;
+    filter2D(gray, dstS_H, CV_8UC1, kernel_TH);
+    filter2D(gray, dstS_V, CV_8UC1, kernel_TV);
+    filter2D(gray, dstS_D, CV_8UC1, kernel_Td);
+
+    addWeighted(dstS_H, 1, dstS_V, 1, 0, dst_HV);
+    addWeighted(dst_HV, 1, dstS_D, 1, 0, dst_S);
+    normalize(dst_S, imgProcessed, 0, 255, NORM_MINMAX, CV_8U);
+
+    matToTexture(imgProcessed, texProcessed);
+    updateHistogram();
+    cout << "Sobel filter applied - Multi-directional edge detection" << endl;
+}
+
+void fn_SobelHorizontal() {
+    if (imgOriginal.empty()) {
+        cout << "Error: No image loaded for Sobel Horizontal" << endl;
+        return;
+    }
+    pushUndo();
+
+    Mat gray;
+    if (imgOriginal.channels() == 3 || imgOriginal.channels() == 4) {
+        cvtColor(imgOriginal, gray, COLOR_BGR2GRAY);
+    }
+    else {
+        gray = imgOriginal.clone();
+    }
+
+    Mat kernel_TH = (Mat_<int>(3, 3) << -1, -2, -1, 0, 0, 0, 1, 2, 1);
+    filter2D(gray, imgProcessed, CV_8UC1, kernel_TH);
+    normalize(imgProcessed, imgProcessed, 0, 255, NORM_MINMAX, CV_8U);
+
+    matToTexture(imgProcessed, texProcessed);
+    updateHistogram();
+    cout << "Sobel Horizontal filter applied - Horizontal edge detection" << endl;
+}
+
+void fn_SobelVertical() {
+    if (imgOriginal.empty()) {
+        cout << "Error: No image loaded for Sobel Vertical" << endl;
+        return;
+    }
+    pushUndo();
+
+    Mat gray;
+    if (imgOriginal.channels() == 3 || imgOriginal.channels() == 4) {
+        cvtColor(imgOriginal, gray, COLOR_BGR2GRAY);
+    }
+    else {
+        gray = imgOriginal.clone();
+    }
+
+    Mat kernel_TV = (Mat_<int>(3, 3) << -1, 0, 1, -2, 0, 2, -1, 0, 1);
+    filter2D(gray, imgProcessed, CV_8UC1, kernel_TV);
+    normalize(imgProcessed, imgProcessed, 0, 255, NORM_MINMAX, CV_8U);
+
+    matToTexture(imgProcessed, texProcessed);
+    updateHistogram();
+    cout << "Sobel Vertical filter applied - Vertical edge detection" << endl;
+}
+
+void fn_SobelDiagonal() {
+    if (imgOriginal.empty()) {
+        cout << "Error: No image loaded for Sobel Diagonal" << endl;
+        return;
+    }
+    pushUndo();
+
+    Mat gray;
+    if (imgOriginal.channels() == 3 || imgOriginal.channels() == 4) {
+        cvtColor(imgOriginal, gray, COLOR_BGR2GRAY);
+    }
+    else {
+        gray = imgOriginal.clone();
+    }
+
+    Mat kernel_Td = (Mat_<int>(3, 3) << 2, 1, 0, 1, 0, -1, 0, -1, -2);
+    filter2D(gray, imgProcessed, CV_8UC1, kernel_Td);
+    normalize(imgProcessed, imgProcessed, 0, 255, NORM_MINMAX, CV_8U);
+
+    matToTexture(imgProcessed, texProcessed);
+    updateHistogram();
+    cout << "Sobel Diagonal filter applied - Diagonal edge detection" << endl;
+}
+
+//Noise
+void fn_AddNoise() {
+    if (imgOriginal.empty()) {
+        cout << "Error: No image loaded for Add Noise" << endl;
+        return;
+    }
+    pushUndo();
+
+    if (imgProcessed.channels() == 1) {
+        // Grayscale image - preserve grayscale
+        Mat noise = Mat::zeros(imgProcessed.size(), CV_8UC1);
+        randn(noise, 0, 30);
+        add(imgProcessed, noise, imgProcessed);
+    }
+    else if (imgProcessed.channels() == 3) {
+        // Color image - add noise to each channel separately
+        vector<Mat> channels;
+        split(imgProcessed, channels);
+
+        for (int i = 0; i < 3; i++) {
+            Mat noise = Mat::zeros(imgProcessed.size(), CV_8UC1);
+            randn(noise, 0, 30);
+            add(channels[i], noise, channels[i]);
+        }
+
+        merge(channels, imgProcessed);
+    }
+    else if (imgProcessed.channels() == 4) {
+        // RGBA image - add noise only to RGB channels
+        vector<Mat> channels;
+        split(imgProcessed, channels);
+
+        for (int i = 0; i < 3; i++) {
+            Mat noise = Mat::zeros(imgProcessed.size(), CV_8UC1);
+            randn(noise, 0, 30);
+            add(channels[i], noise, channels[i]);
+        }
+
+        merge(channels, imgProcessed);
+    }
+    else {
+        // Fallback to original image
+        Mat noise = Mat::zeros(imgOriginal.size(), CV_8UC1);
+        randn(noise, 0, 30);
+        add(imgOriginal, noise, imgProcessed);
+    }
+
+    matToTexture(imgProcessed, texProcessed);
+    updateHistogram();
+    cout << "Gaussian noise added to image - Preserved current format (grayscale remains grayscale)" << endl;
+}
+
+//Canny 
+void fn_Canny() {
+    if (imgOriginal.empty()) {
+        cout << "Error: No image loaded for Canny Edge Detection" << endl;
+        return;
+    }
+    pushUndo();
+    Mat gray;
+    if (imgOriginal.channels() == 3) {
+        cvtColor(imgOriginal, gray, COLOR_BGR2GRAY);
+    }
+    else {
+        gray = imgOriginal.clone();
+    }
+
+    Canny(gray, imgProcessed, 100, 200);
+    matToTexture(imgProcessed, texProcessed);
+    updateHistogram();
+    cout << "Canny edge detection applied" << endl;
+}
+
+// NEW COMPRESSION FUNCTIONS
+
+// Helper function to generate Huffman codes
+void generateHuffmanCodes(HuffmanNode* root, string code, map<int, string>& huffmanCode) {
+    if (!root) return;
+
+    // Leaf node
+    if (!root->left && !root->right) {
+        huffmanCode[root->pixelValue] = code;
+    }
+
+    generateHuffmanCodes(root->left, code + "0", huffmanCode);
+    generateHuffmanCodes(root->right, code + "1", huffmanCode);
+}
+
+// Function to calculate compression metrics
+void calculateCompressionMetrics(const Mat& original, const Mat& compressed,
+    double& compressionRatio, double& rmse, double& psnr) {
+    if (original.empty() || compressed.empty()) {
+        compressionRatio = 0;
+        rmse = 0;
+        psnr = 0;
+        return;
+    }
+
+    // Calculate Compression Ratio (CR)
+    size_t originalSize = original.total() * original.elemSize();
+    size_t compressedSize = compressed.total() * compressed.elemSize();
+
+    compressionRatio = (compressedSize > 0) ? (double)originalSize / compressedSize : 0;
+
+    // Ensure both images are same size
+    Mat compressedResized;
+    if (original.size() != compressed.size()) {
+        resize(compressed, compressedResized, original.size(), 0, 0, INTER_LINEAR);
+    }
+    else {
+        compressedResized = compressed.clone();
+    }
+
+    // Prepare images for comparison
+    Mat originalForCompare, compressedForCompare;
+
+    // Handle different channel types
+    if (original.channels() == 3 && compressedResized.channels() == 3) {
+        // Both are color images
+        originalForCompare = original.clone();
+        compressedForCompare = compressedResized.clone();
+    }
+    else if (original.channels() == 3 && compressedResized.channels() == 1) {
+        // Original is color, compressed is grayscale
+        cvtColor(original, originalForCompare, COLOR_BGR2GRAY);
+        compressedForCompare = compressedResized.clone();
+    }
+    else if (original.channels() == 1 && compressedResized.channels() == 3) {
+        // Original is grayscale, compressed is color
+        originalForCompare = original.clone();
+        cvtColor(compressedResized, compressedForCompare, COLOR_BGR2GRAY);
+    }
+    else if (original.channels() == 1 && compressedResized.channels() == 1) {
+        // Both are grayscale
+        originalForCompare = original.clone();
+        compressedForCompare = compressedResized.clone();
+    }
+    else if (original.channels() == 4) {
+        // Original has alpha channel
+        if (compressedResized.channels() == 4) {
+            cvtColor(original, originalForCompare, COLOR_BGRA2BGR);
+            cvtColor(compressedResized, compressedForCompare, COLOR_BGRA2BGR);
+        }
+        else if (compressedResized.channels() == 3) {
+            cvtColor(original, originalForCompare, COLOR_BGRA2BGR);
+            compressedForCompare = compressedResized.clone();
+        }
+        else if (compressedResized.channels() == 1) {
+            cvtColor(original, originalForCompare, COLOR_BGRA2GRAY);
+            compressedForCompare = compressedResized.clone();
+        }
+    }
+    else {
+        // Default: convert both to grayscale
+        if (original.channels() == 3) {
+            cvtColor(original, originalForCompare, COLOR_BGR2GRAY);
+        }
+        else {
+            originalForCompare = original.clone();
+        }
+
+        if (compressedResized.channels() == 3) {
+            cvtColor(compressedResized, compressedForCompare, COLOR_BGR2GRAY);
+        }
+        else {
+            compressedForCompare = compressedResized.clone();
+        }
+    }
+
+    // Ensure both are 8-bit for PSNR calculation
+    if (originalForCompare.depth() != CV_8U) {
+        originalForCompare.convertTo(originalForCompare, CV_8U);
+    }
+
+    if (compressedForCompare.depth() != CV_8U) {
+        compressedForCompare.convertTo(compressedForCompare, CV_8U);
+    }
+
+    // Calculate PSNR
+    if (!originalForCompare.empty() && !compressedForCompare.empty() &&
+        originalForCompare.size() == compressedForCompare.size()) {
+        psnr = PSNR(originalForCompare, compressedForCompare);
+    }
+    else {
+        psnr = 0;
+    }
+
+    // Calculate RMSE manually
+    if (!originalForCompare.empty() && !compressedForCompare.empty() &&
+        originalForCompare.size() == compressedForCompare.size()) {
+
+        // Convert to float for accurate calculation
+        Mat originalFloat, compressedFloat;
+        originalForCompare.convertTo(originalFloat, CV_32F);
+        compressedForCompare.convertTo(compressedFloat, CV_32F);
+
+        // Calculate difference
+        Mat diff;
+        absdiff(originalFloat, compressedFloat, diff);
+
+        // Square the differences
+        diff = diff.mul(diff);
+
+        // Calculate mean
+        Scalar s = sum(diff);
+        double mse = s[0] / (double)(diff.total() * diff.channels());
+
+        rmse = sqrt(mse);
+    }
+    else {
+        rmse = 0;
+    }
+
+    // Ensure valid values
+    if (isinf(psnr) || isnan(psnr)) {
+        psnr = 99.99; // Maximum PSNR for identical images
+    }
+
+    if (isinf(rmse) || isnan(rmse)) {
+        rmse = 0;
+    }
+}
+
+// Lossless Compression using Huffman Coding - SEPARATE FUNCTION
+void fn_HuffmanCompression() {
+    if (imgOriginal.empty()) {
+        cout << "Error: No image loaded for Huffman Compression" << endl;
+        return;
+    }
+
+    pushUndo();
+
+    // Convert to grayscale if needed
+    Mat gray;
+    if (imgOriginal.channels() == 3 || imgOriginal.channels() == 4) {
+        cvtColor(imgOriginal, gray, COLOR_BGR2GRAY);
+    }
+    else {
+        gray = imgOriginal.clone();
+    }
+
+    // Store original for metrics calculation
+    Mat originalForMetrics = gray.clone();
+
+    // Calculate pixel frequencies
+    map<int, int> freq;
+    for (int i = 0; i < gray.rows; i++) {
+        for (int j = 0; j < gray.cols; j++) {
+            freq[gray.at<uchar>(i, j)]++;
+        }
+    }
+
+    // Create priority queue for Huffman tree
+    priority_queue<HuffmanNode*, vector<HuffmanNode*>, CompareNodes> pq;
+
+    for (auto& pair : freq) {
+        pq.push(new HuffmanNode(pair.first, pair.second));
+    }
+
+    // Build Huffman tree
+    while (pq.size() > 1) {
+        HuffmanNode* left = pq.top(); pq.pop();
+        HuffmanNode* right = pq.top(); pq.pop();
+
+        HuffmanNode* parent = new HuffmanNode(-1, left->frequency + right->frequency);
+        parent->left = left;
+        parent->right = right;
+
+        pq.push(parent);
+    }
+
+    // Generate Huffman codes
+    HuffmanNode* root = pq.top();
+    map<int, string> huffmanCode;
+    generateHuffmanCodes(root, "", huffmanCode);
+
+    // SIMULATE ENCODING AND DECODING
+    // Create encoded bits string
+    string encodedBits = "";
+    for (int i = 0; i < gray.rows; i++) {
+        for (int j = 0; j < gray.cols; j++) {
+            encodedBits += huffmanCode[gray.at<uchar>(i, j)];
+        }
+    }
+
+    // Calculate actual compression metrics
+    double originalSize = gray.total() * gray.elemSize(); // bytes
+    double compressedSizeBits = encodedBits.length();
+    double compressedSizeBytes = compressedSizeBits / 8.0;
+
+    double cr = originalSize / compressedSizeBytes;
+    double rmse = 0.0; // Lossless compression = no error
+    double psnr = INFINITY; // Perfect reconstruction
+
+    // For PSNR calculation (will be infinity, so we cap it)
+    if (isinf(psnr)) {
+        psnr = 99.99; // Maximum PSNR for lossless
+    }
+
+    // Display compression information
+    cout << "HUFFMAN COMPRESSION" << endl;
+    cout << "Number of unique pixel values: " << freq.size() << endl;
+    cout << "Original Size: " << originalSize << " bytes" << endl;
+    cout << "Compressed Size: " << compressedSizeBytes << " bytes (" << compressedSizeBits << " bits)" << endl;
+    cout << "Compression Ratio (CR): " << cr << ":1" << endl;
+    cout << "RMSE: " << rmse << " (lossless)" << endl;
+    cout << "PSNR: " << psnr << " dB (lossless)" << endl;
+
+    // Show first 10 codes as example
+    int count = 0;
+    cout << "Sample Huffman codes:" << endl;
+    for (auto& pair : huffmanCode) {
+        if (count < 10) {
+            cout << "  Pixel " << pair.first << " -> Code: " << pair.second << endl;
+            count++;
+        }
+    }
+
+    // For demonstration, we'll show the original image as processed
+    imgProcessed = gray.clone();
+
+    // Show Huffman window
+    showHuffmanWindow = true;
+    huffmanImage = gray.clone();
+    matToTexture(huffmanImage, texHuffman);
+    updateHistogram();
+    // Store metrics for display in the GUI window
+    // We'll pass these to the window through global variables or a struct
+    static double huffmanCR = cr;
+    static double huffmanRMSE = rmse;
+    static double huffmanPSNR = psnr;
+    huffmanCR = cr;
+    huffmanRMSE = rmse;
+    huffmanPSNR = psnr;
+
+    // Clean up Huffman tree
+    deleteHuffmanTree(root);
+
+    cout << "Huffman compression analysis completed" << endl;
+    // Store metrics in global struct for GUI display
+    huffmanMetrics.cr = cr;
+    huffmanMetrics.rmse = rmse;
+    huffmanMetrics.psnr = psnr;
+    huffmanMetrics.originalSize = originalSize;
+    huffmanMetrics.compressedSize = compressedSizeBytes;
+
+    cout << "HUFFMAN COMPRESSION METRICS" << endl;
+    cout << "CR: " << cr << ":1" << endl;
+    cout << "RMSE: " << rmse << endl;
+    cout << "PSNR: " << psnr << " dB" << endl;
+    cout << "Original: " << originalSize << " bytes" << endl;
+    cout << "Compressed: " << compressedSizeBytes << " bytes" << endl;
+}
+// Lossy Compression using DCT (Discrete Cosine Transform) - SEPARATE FUNCTION
+void fn_LossyCompression() {
+    if (imgOriginal.empty()) {
+        cout << "Error: No image loaded for Lossy Compression" << endl;
+        return;
+    }
+
+    pushUndo();
+
+    // Convert to grayscale if needed
+    Mat gray;
+    if (imgOriginal.channels() == 3 || imgOriginal.channels() == 4) {
+        cvtColor(imgOriginal, gray, COLOR_BGR2GRAY);
+    }
+    else {
+        gray = imgOriginal.clone();
+    }
+
+    // Convert to float for DCT
+    Mat floatGray;
+    gray.convertTo(floatGray, CV_32F);
+
+    // Apply DCT block by block (8x8 blocks)
+    Mat dctResult = Mat::zeros(floatGray.size(), CV_32F);
+    int blockSize = 8;
+
+    for (int i = 0; i < floatGray.rows; i += blockSize) {
+        for (int j = 0; j < floatGray.cols; j += blockSize) {
+            Rect blockRect(j, i, min(blockSize, floatGray.cols - j),
+                min(blockSize, floatGray.rows - i));
+            Mat block = floatGray(blockRect).clone();
+
+            // Apply DCT
+            Mat dctBlock;
+            dct(block, dctBlock);
+
+            // Apply quantization (simulated compression)
+            // Higher quality = less compression, lower quality = more compression
+            float qualityFactor = dctQuality / 100.0f;
+            for (int x = 0; x < dctBlock.rows; x++) {
+                for (int y = 0; y < dctBlock.cols; y++) {
+                    // Simple quantization matrix (zigzag pattern)
+                    int quant = 1 + (x + y) * (1.0f - qualityFactor);
+                    dctBlock.at<float>(x, y) = round(dctBlock.at<float>(x, y) / quant) * quant;
+                }
+            }
+
+            // Apply inverse DCT
+            Mat idctBlock;
+            idct(dctBlock, idctBlock);
+
+            // Copy back to result
+            idctBlock.copyTo(dctResult(blockRect));
+        }
+    }
+
+    // Convert back to 8-bit
+    Mat compressed;
+    dctResult.convertTo(compressed, CV_8U);
+
+    imgProcessed = compressed.clone();
+    matToTexture(imgProcessed, texProcessed);
+
+    // Calculate compression metrics
+    double cr, rmse, psnr;
+    calculateCompressionMetrics(gray, compressed, cr, rmse, psnr);
+
+    cout << "LOSSY COMPRESSION (DCT)" << endl;
+    cout << "Compression Quality: " << dctQuality << "%" << endl;
+    cout << "Compression Ratio (CR): " << cr << ":1" << endl;
+    cout << "RMSE: " << rmse << endl;
+    cout << "PSNR: " << psnr << " dB" << endl;
+
+    // Show lossy compression window
+    showLossyWindow = true;
+    lossyImage = compressed.clone();
+    matToTexture(lossyImage, texLossy);
+    updateHistogram();
+    // Store metrics in global struct
+    lossyMetrics.cr = cr;
+    lossyMetrics.rmse = rmse;
+    lossyMetrics.psnr = psnr;
+    lossyMetrics.originalSize = gray.total() * gray.elemSize();
+    lossyMetrics.compressedSize = compressed.total() * compressed.elemSize();
+}
+
+// Crop Image Function - MOVED TO GEOMETRIC TRANSFORMATIONS
+void fn_CropImage() {
+    if (imgOriginal.empty()) {
+        cout << "Error: No image loaded for Crop" << endl;
+        return;
+    }
+
+    pushUndo();
+
+    // Calculate crop coordinates based on percentage
+    int x = (int)(cropX / 100.0f * imgOriginal.cols);
+    int y = (int)(cropY / 100.0f * imgOriginal.rows);
+    int width = (int)(cropWidth / 100.0f * imgOriginal.cols);
+    int height = (int)(cropHeight / 100.0f * imgOriginal.rows);
+
+    // Ensure coordinates are within bounds
+    x = max(0, min(x, imgOriginal.cols - 1));
+    y = max(0, min(y, imgOriginal.rows - 1));
+    width = max(1, min(width, imgOriginal.cols - x));
+    height = max(1, min(height, imgOriginal.rows - y));
+
+    // Perform cropping
+    Rect cropRect(x, y, width, height);
+    imgProcessed = imgOriginal(cropRect).clone();
+
+    matToTexture(imgProcessed, texProcessed);
+
+    cout << "=== IMAGE CROP ===" << endl;
+    cout << "Crop Region: X=" << x << ", Y=" << y <<
+        ", Width=" << width << ", Height=" << height << endl;
+    cout << "Original Size: " << imgOriginal.cols << "x" << imgOriginal.rows << endl;
+    cout << "Cropped Size: " << imgProcessed.cols << "x" << imgProcessed.rows << endl;
+
+    // Show crop window
+    showCropWindow = true;
+    croppedImage = imgProcessed.clone();
+    matToTexture(croppedImage, texCropped);
+}
+
+// Update crop preview
+void updateCropPreview() {
+    if (imgOriginal.empty()) return;
+
+    // Calculate crop coordinates
+    int x = (int)(cropX / 100.0f * imgOriginal.cols);
+    int y = (int)(cropY / 100.0f * imgOriginal.rows);
+    int width = (int)(cropWidth / 100.0f * imgOriginal.cols);
+    int height = (int)(cropHeight / 100.0f * imgOriginal.rows);
+
+    // Ensure coordinates are within bounds
+    x = max(0, min(x, imgOriginal.cols - 1));
+    y = max(0, min(y, imgOriginal.rows - 1));
+    width = max(1, min(width, imgOriginal.cols - x));
+    height = max(1, min(height, imgOriginal.rows - y));
+
+    // Create preview image with crop rectangle
+    Mat preview = imgOriginal.clone();
+    rectangle(preview, Rect(x, y, width, height), Scalar(0, 255, 0), 2);
+
+    imgProcessed = preview.clone();
+    matToTexture(imgProcessed, texProcessed);
+}
+
+// Help Window Function 
+void ShowHelpWindow(bool* p_open) {
+    if (!ImGui::Begin("Help - Button Functions Guide", p_open, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::End();
+        return;
+    }
+
+    ImGui::TextColored(ImVec4(0.3f, 0.3f, 0.3f, 1.f), "Ultimate Image Processing Studio - Help Guide");
+    ImGui::Separator();
+
+    if (ImGui::CollapsingHeader("Image Controls")) {
+        ImGui::BulletText("Upload Image: Load new image from file (JPG, PNG, BMP, TIF)");
+        ImGui::BulletText("Save Image: Save processed image to file");
+        ImGui::BulletText("Reset: Reset image to original state");
+        ImGui::BulletText("Undo: Undo last operation");
+        ImGui::BulletText("Image Info: Show detailed image information");
+    }
+
+    if (ImGui::CollapsingHeader("Geometric Transformations")) {
+        ImGui::BulletText("Apply Rotation: Rotate image by specified angle");
+        ImGui::BulletText("Apply Translation: Move image by X and Y pixels");
+        ImGui::BulletText("Apply Zoom: Scale image by specified factor");
+        ImGui::BulletText("Apply Skew: Apply skew transformation with adjustable parameters");
+        ImGui::BulletText("Flip X/Y/XY: Mirror image horizontally/vertically/both");
+        ImGui::BulletText("Crop Image: Select and crop region of interest");
+    }
+
+    if (ImGui::CollapsingHeader("Image Enhancement")) {
+        ImGui::BulletText("Negative: Invert image colors (shows photo negative)");
+        ImGui::BulletText("Log Transform: Apply logarithmic transformation for contrast enhancement in dark areas");
+        ImGui::BulletText("Gamma Correction: Adjust image gamma for brightness control");
+        ImGui::BulletText("Bit-plane Slicing: Extract specific bit planes from image (shows binary patterns)");
+        ImGui::BulletText("Gray-level Slicing: Highlight specific intensity ranges in the image");
+        ImGui::BulletText("Add Gaussian Noise: Add random noise to image (preserves current format)");
+        ImGui::BulletText("Canny Edge Detection: Detect edges in the image");
+        ImGui::BulletText("RGB to Grayscale: Convert color image to grayscale");
+        ImGui::BulletText("DFT Low-Pass Filter: Frequency domain filtering using Discrete Fourier Transform");
+        ImGui::BulletText("Edge Detection Segmentation: Region-based and threshold-based segmentation");
+    }
+
+    if (ImGui::CollapsingHeader("Morphological Operations")) {
+        ImGui::BulletText("Smooth Filter: Selects minimum pixel value in 3x3 neighborhood");
+        ImGui::BulletText("Max Filter: Selects maximum pixel value in 3x3 neighborhood");
+        ImGui::BulletText("Median Filter: Selects median pixel value in 3x3 neighborhood (noise reduction)");
+        ImGui::BulletText("Erosion: Shrinks white regions, expands black regions");
+        ImGui::BulletText("Dilation: Expands white regions, shrinks black regions");
+        ImGui::BulletText("Opening: Erosion followed by dilation (removes small white noise)");
+        ImGui::BulletText("Closing: Dilation followed by erosion (fills small black holes)");
+    }
+
+    if (ImGui::CollapsingHeader("Histogram Analysis")) {
+        ImGui::BulletText("Histogram Equalization: Enhance image contrast using histogram equalization");
+        ImGui::BulletText("Histogram Analysis: Show detailed histogram analysis in console and visual graph");
+        ImGui::BulletText("Object Detection: Detect bright objects using thresholding (150)");
+    }
+
+    if (ImGui::CollapsingHeader("Advanced Filters")) {
+        ImGui::BulletText("Traditional Filter: 3x3 averaging filter for noise reduction");
+        ImGui::BulletText("Pyramidal Filter: Smooth transitions with edge preservation");
+        ImGui::BulletText("Circular Filter: Circular symmetry enhancement");
+        ImGui::BulletText("Cone Filter: 3D cone effect for depth perception");
+        ImGui::BulletText("Laplacian Filter: Edge detection using Laplacian operator");
+        ImGui::BulletText("Sobel Filter: Multi-directional edge detection");
+        ImGui::BulletText("Sobel Horizontal: Horizontal edge detection");
+        ImGui::BulletText("Sobel Vertical: Vertical edge detection");
+        ImGui::BulletText("Sobel Diagonal: Diagonal edge detection");
+    }
+
+    if (ImGui::CollapsingHeader("Compression Operations")) {
+        ImGui::BulletText("Huffman Compression: Lossless compression using Huffman coding");
+        ImGui::BulletText("Lossy Compression (DCT): Compress image with adjustable quality using DCT");
+    }
+
+    if (ImGui::CollapsingHeader("Keyboard Shortcuts")) {
+        ImGui::BulletText("X Key: Flip image horizontally");
+        ImGui::BulletText("Y Key: Flip image vertically");
+        ImGui::BulletText("Z Key: Flip image both horizontally and vertically");
+        ImGui::BulletText("Mouse Wheel: Zoom in/out smoothly");
+    }
+
+    ImGui::Spacing();
+    ImGui::TextColored(ImVec4(0.0f, 0.5f, 1.0f, 1.0f), "Note: All operations support undo/redo functionality");
+    ImGui::TextColored(ImVec4(0.8f, 0.4f, 0.0f, 1.0f), "Tip: Use real-time preview for geometric transformations");
+
+    ImGui::Spacing();
+    if (ImGui::Button("Close Help", ImVec2(120, 30))) {
+        *p_open = false;
+    }
+
+    ImGui::End();
+}
+
+//Theme Functions 
+void ApplyDarkTheme() {
+    ImGuiStyle& style = ImGui::GetStyle();
+    ImVec4* colors = style.Colors;
+
+    // Dark theme colors - true black background
+    colors[ImGuiCol_Text] = ImVec4(1.00f, 1.00f, 1.00f, 1.00f);
+    colors[ImGuiCol_TextDisabled] = ImVec4(0.50f, 0.50f, 0.50f, 1.00f);
+    colors[ImGuiCol_WindowBg] = ImVec4(0.0f, 0.0f, 0.0f, 1.00f);
+    colors[ImGuiCol_ChildBg] = ImVec4(0.0f, 0.0f, 0.0f, 1.00f);
+    colors[ImGuiCol_PopupBg] = ImVec4(0.0f, 0.0f, 0.0f, 0.94f);
+    colors[ImGuiCol_MenuBarBg] = ImVec4(0.0f, 0.0f, 0.0f, 1.00f);
+    colors[ImGuiCol_FrameBg] = ImVec4(0.15f, 0.15f, 0.15f, 0.54f);
+    colors[ImGuiCol_TitleBg] = ImVec4(0.0f, 0.0f, 0.0f, 1.00f);
+    colors[ImGuiCol_TitleBgActive] = ImVec4(0.0f, 0.0f, 0.0f, 1.00f);
+    colors[ImGuiCol_TitleBgCollapsed] = ImVec4(0.00f, 0.00f, 0.00f, 0.51f);
+    colors[ImGuiCol_ScrollbarBg] = ImVec4(0.02f, 0.02f, 0.02f, 0.53f);
+    colors[ImGuiCol_ScrollbarGrab] = ImVec4(0.31f, 0.31f, 0.31f, 1.00f);
+    colors[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.41f, 0.41f, 0.41f, 1.00f);
+    colors[ImGuiCol_ScrollbarGrabActive] = ImVec4(0.51f, 0.51f, 0.51f, 1.00f);
+    colors[ImGuiCol_CheckMark] = ImVec4(0.94f, 0.26f, 0.21f, 1.00f);
+    colors[ImGuiCol_SliderGrab] = ImVec4(0.94f, 0.26f, 0.21f, 1.00f);
+    colors[ImGuiCol_SliderGrabActive] = ImVec4(0.94f, 0.26f, 0.21f, 1.00f);
+    colors[ImGuiCol_Button] = ImVec4(0.44f, 0.16f, 0.16f, 1.00f);
+    colors[ImGuiCol_ButtonHovered] = ImVec4(0.94f, 0.26f, 0.21f, 1.00f);
+    colors[ImGuiCol_ButtonActive] = ImVec4(0.86f, 0.23f, 0.18f, 1.00f);
+    colors[ImGuiCol_Header] = ImVec4(0.44f, 0.16f, 0.16f, 1.00f);
+    colors[ImGuiCol_HeaderHovered] = ImVec4(0.94f, 0.26f, 0.21f, 1.00f);
+    colors[ImGuiCol_HeaderActive] = ImVec4(0.86f, 0.23f, 0.18f, 1.00f);
+    colors[ImGuiCol_Separator] = ImVec4(0.43f, 0.43f, 0.50f, 0.50f);
+    colors[ImGuiCol_SeparatorHovered] = ImVec4(0.94f, 0.26f, 0.21f, 1.00f);
+    colors[ImGuiCol_SeparatorActive] = ImVec4(0.86f, 0.23f, 0.18f, 1.00f);
+    colors[ImGuiCol_ResizeGrip] = ImVec4(0.44f, 0.16f, 0.16f, 1.00f);
+    colors[ImGuiCol_ResizeGripHovered] = ImVec4(0.94f, 0.26f, 0.21f, 1.00f);
+    colors[ImGuiCol_ResizeGripActive] = ImVec4(0.86f, 0.23f, 0.18f, 1.00f);
+    colors[ImGuiCol_Tab] = ImVec4(0.44f, 0.16f, 0.16f, 1.00f);
+    colors[ImGuiCol_TabHovered] = ImVec4(0.94f, 0.26f, 0.21f, 1.00f);
+    colors[ImGuiCol_TabActive] = ImVec4(0.86f, 0.23f, 0.18f, 1.00f);
+    colors[ImGuiCol_TabUnfocused] = ImVec4(0.44f, 0.16f, 0.16f, 1.00f);
+    colors[ImGuiCol_TabUnfocusedActive] = ImVec4(0.86f, 0.23f, 0.18f, 1.00f);
+    colors[ImGuiCol_PlotLines] = ImVec4(0.61f, 0.61f, 0.61f, 1.00f);
+    colors[ImGuiCol_PlotLinesHovered] = ImVec4(1.00f, 0.43f, 0.35f, 1.00f);
+    colors[ImGuiCol_PlotHistogram] = ImVec4(0.90f, 0.70f, 0.00f, 1.00f);
+    colors[ImGuiCol_PlotHistogramHovered] = ImVec4(1.00f, 0.60f, 0.00f, 1.00f);
+    colors[ImGuiCol_TextSelectedBg] = ImVec4(0.94f, 0.26f, 0.21f, 0.35f);
+    colors[ImGuiCol_DragDropTarget] = ImVec4(1.00f, 1.00f, 0.00f, 0.90f);
+    colors[ImGuiCol_NavHighlight] = ImVec4(0.94f, 0.26f, 0.21f, 1.00f);
+    colors[ImGuiCol_NavWindowingHighlight] = ImVec4(1.00f, 1.00f, 1.00f, 0.70f);
+    colors[ImGuiCol_NavWindowingDimBg] = ImVec4(0.80f, 0.80f, 0.80f, 0.20f);
+    colors[ImGuiCol_ModalWindowDimBg] = ImVec4(0.80f, 0.80f, 0.80f, 0.35f);
+
+    style.WindowRounding = 12.0f;
+    style.ChildRounding = 12.0f;
+    style.FrameRounding = 8.0f;
+    style.GrabRounding = 8.0f;
+    style.PopupRounding = 8.0f;
+    style.ScrollbarRounding = 8.0f;
+    style.TabRounding = 8.0f;
+}
+
+void ApplyLightTheme() {
+    ImGuiStyle& style = ImGui::GetStyle();
+    ImVec4* colors = style.Colors;
+
+    // Light theme colors - all white background
+    colors[ImGuiCol_Text] = ImVec4(0.00f, 0.00f, 0.00f, 1.00f);
+    colors[ImGuiCol_TextDisabled] = ImVec4(0.60f, 0.60f, 0.60f, 1.00f);
+    colors[ImGuiCol_WindowBg] = ImVec4(1.00f, 1.00f, 1.00f, 1.00f);
+    colors[ImGuiCol_ChildBg] = ImVec4(1.00f, 1.00f, 1.00f, 1.00f);
+    colors[ImGuiCol_PopupBg] = ImVec4(1.00f, 1.00f, 1.00f, 0.98f);
+    colors[ImGuiCol_Border] = ImVec4(0.00f, 0.00f, 0.00f, 0.30f);
+    colors[ImGuiCol_BorderShadow] = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
+    colors[ImGuiCol_FrameBg] = ImVec4(0.95f, 0.95f, 0.95f, 1.00f);
+    colors[ImGuiCol_FrameBgHovered] = ImVec4(0.90f, 0.90f, 0.90f, 1.00f);
+    colors[ImGuiCol_FrameBgActive] = ImVec4(0.85f, 0.85f, 0.85f, 1.00f);
+    colors[ImGuiCol_TitleBg] = ImVec4(0.96f, 0.96f, 0.96f, 1.00f);
+    colors[ImGuiCol_TitleBgActive] = ImVec4(0.82f, 0.82f, 0.82f, 1.00f);
+    colors[ImGuiCol_TitleBgCollapsed] = ImVec4(1.00f, 1.00f, 1.00f, 0.51f);
+    colors[ImGuiCol_MenuBarBg] = ImVec4(0.96f, 0.96f, 0.96f, 1.00f);
+    colors[ImGuiCol_ScrollbarBg] = ImVec4(0.98f, 0.98f, 0.98f, 0.53f);
+    colors[ImGuiCol_ScrollbarGrab] = ImVec4(0.69f, 0.69f, 0.69f, 1.00f);
+    colors[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.59f, 0.59f, 0.59f, 1.00f);
+    colors[ImGuiCol_ScrollbarGrabActive] = ImVec4(0.49f, 0.49f, 0.49f, 1.00f);
+    colors[ImGuiCol_CheckMark] = ImVec4(0.00f, 0.44f, 0.88f, 1.00f);
+    colors[ImGuiCol_SliderGrab] = ImVec4(0.00f, 0.44f, 0.88f, 1.00f);
+    colors[ImGuiCol_SliderGrabActive] = ImVec4(0.00f, 0.35f, 0.70f, 1.00f);
+    colors[ImGuiCol_Button] = ImVec4(0.00f, 0.44f, 0.88f, 1.00f);
+    colors[ImGuiCol_ButtonHovered] = ImVec4(0.00f, 0.53f, 1.00f, 1.00f);
+    colors[ImGuiCol_ButtonActive] = ImVec4(0.00f, 0.40f, 0.80f, 1.00f);
+    colors[ImGuiCol_Header] = ImVec4(0.00f, 0.44f, 0.88f, 0.31f);
+    colors[ImGuiCol_HeaderHovered] = ImVec4(0.00f, 0.53f, 1.00f, 0.80f);
+    colors[ImGuiCol_HeaderActive] = ImVec4(0.00f, 0.40f, 0.80f, 1.00f);
+    colors[ImGuiCol_Separator] = ImVec4(0.00f, 0.00f, 0.00f, 0.50f);
+    colors[ImGuiCol_SeparatorHovered] = ImVec4(0.10f, 0.40f, 0.75f, 0.78f);
+    colors[ImGuiCol_SeparatorActive] = ImVec4(0.10f, 0.40f, 0.75f, 1.00f);
+    colors[ImGuiCol_ResizeGrip] = ImVec4(0.00f, 0.44f, 0.88f, 0.25f);
+    colors[ImGuiCol_ResizeGripHovered] = ImVec4(0.00f, 0.53f, 1.00f, 0.67f);
+    colors[ImGuiCol_ResizeGripActive] = ImVec4(0.00f, 0.40f, 0.80f, 0.95f);
+    colors[ImGuiCol_Tab] = ImVec4(0.00f, 0.44f, 0.88f, 0.86f);
+    colors[ImGuiCol_TabHovered] = ImVec4(0.00f, 0.53f, 1.00f, 0.80f);
+    colors[ImGuiCol_TabActive] = ImVec4(0.15f, 0.60f, 1.00f, 1.00f);
+    colors[ImGuiCol_TabUnfocused] = ImVec4(0.95f, 0.95f, 0.95f, 1.00f);
+    colors[ImGuiCol_TabUnfocusedActive] = ImVec4(0.82f, 0.82f, 0.82f, 1.00f);
+    colors[ImGuiCol_PlotLines] = ImVec4(0.00f, 0.00f, 0.00f, 1.00f);
+    colors[ImGuiCol_PlotLinesHovered] = ImVec4(1.00f, 0.43f, 0.35f, 1.00f);
+    colors[ImGuiCol_PlotHistogram] = ImVec4(0.00f, 0.44f, 0.88f, 1.00f);
+    colors[ImGuiCol_PlotHistogramHovered] = ImVec4(1.00f, 0.60f, 0.00f, 1.00f);
+    colors[ImGuiCol_TextSelectedBg] = ImVec4(0.00f, 0.53f, 1.00f, 0.35f);
+    colors[ImGuiCol_DragDropTarget] = ImVec4(1.00f, 1.00f, 0.00f, 0.90f);
+    colors[ImGuiCol_NavHighlight] = ImVec4(0.00f, 0.44f, 0.88f, 1.00f);
+    colors[ImGuiCol_NavWindowingHighlight] = ImVec4(1.00f, 1.00f, 1.00f, 0.70f);
+    colors[ImGuiCol_NavWindowingDimBg] = ImVec4(0.80f, 0.80f, 0.80f, 0.20f);
+    colors[ImGuiCol_ModalWindowDimBg] = ImVec4(0.80f, 0.80f, 0.80f, 0.35f);
+
+    style.WindowRounding = 10.0f;
+    style.FrameRounding = 6.0f;
+    style.GrabRounding = 6.0f;
+    style.PopupRounding = 6.0f;
+    style.ScrollbarRounding = 8.0f;
+    style.TabRounding = 8.0f;
+}
+
+// Main
+int main() {
+    if (!glfwInit()) return -1;
+
+    const char* glsl_version = "#version 330";
+    GLFWwindow* window = glfwCreateWindow(1600, 1000, "Image Processing - AhmedH", NULL, NULL);
+    if (!window) {
+        glfwTerminate();
+        return -1;
+    }
+
+    glfwMakeContextCurrent(window);
+    glfwSwapInterval(1);
+
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO(); (void)io;
+
+    try {
+        io.Fonts->AddFontFromFileTTF("C:/Windows/Fonts/arial.ttf", 20.0f);
+    }
+    catch (...) {
+        io.Fonts->AddFontDefault();
+    }
+
+    // Apply light theme by default
+    ApplyLightTheme();
+
+    ImGui_ImplGlfw_InitForOpenGL(window, true);
+    ImGui_ImplOpenGL3_Init(glsl_version);
+
+    // Control variables
+    static float zoomScale = 1.0f, transX = 0.0f, transY = 0.0f, rotateAngle = 0.0f;
+    static float skewX = 50.0f, skewY = 0.0f;
+    static char gammaInput[8] = "1.5";
+    static bool realTimeTransform = true;
+    static int selectedFilter = 0;
+    static int selectedBitPlane = 6;
+    static int grayLower = 100, grayUpper = 200;
+
+    vector<string> filterNames = {
+        "Traditional 3x3 Filter",
+        "Pyramidal Filter",
+        "Circular Filter",
+        "Cone Filter",
+        "Laplacian Filter",
+        "Sobel Filter",
+        "Sobel Horizontal",
+        "Sobel Vertical",
+        "Sobel Diagonal"
+    };
+
+    // Mouse Zoom setup
+    glfwSetScrollCallback(window, [](GLFWwindow* win, double xoffset, double yoffset) {
+        if (yoffset > 0) zoomScale *= 1.1f;
+        else if (yoffset < 0) zoomScale /= 1.1f;
+        zoomScale = max(0.1f, min(zoomScale, 5.0f));
+        realTimeTransform = true;
+        });
+
+    // Keyboard Flip setup
+    glfwSetKeyCallback(window, [](GLFWwindow* win, int key, int scancode, int action, int mods) {
+        if (action == GLFW_PRESS) {
+            if (key == GLFW_KEY_X) fn_FlipX();
+            if (key == GLFW_KEY_Y) fn_FlipY();
+            if (key == GLFW_KEY_Z) fn_FlipXY();
+        }
+        });
+
+    while (!glfwWindowShouldClose(window)) {
+        glfwPollEvents();
+        ImGui_ImplOpenGL3_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+
+        // Show Help Window if opened
+        if (showHelpWindow) {
+            ShowHelpWindow(&showHelpWindow);
+        }
+
+        // DFT Window
+        if (showDFTWindow) {
+            ImGui::SetNextWindowSize(ImVec2(1200, 700), ImGuiCond_FirstUseEver);
+            if (ImGui::Begin("DFT Low-Pass Filter Analysis", &showDFTWindow,
+                ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize)) {
+
+                if (darkMode) {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+                    ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f),
+                        "DFT (Discrete Fourier Transform) Frequency Domain Filtering");
+                }
+                else {
+                    ImGui::TextColored(ImVec4(0.0f, 0.4f, 0.8f, 1.0f),
+                        "DFT (Discrete Fourier Transform) Frequency Domain Filtering");
+                }
+                ImGui::Separator();
+
+                ImGui::Text("Low-Pass Filter: Preserves low frequencies (smooth areas), removes high frequencies (edges/noise)");
+                ImGui::Text("Cutoff Frequency (D0): Controls how much high frequency content to remove");
+                ImGui::Separator();
+
+                // control
+                if (darkMode) {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+                }
+                else {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                }
+                ImGui::BeginChild("DFT Controls", ImVec2(300, 300), true);
+                if (darkMode) {
+                    ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "FILTER CONTROLS");
+                }
+                else {
+                    ImGui::TextColored(ImVec4(0.0f, 0.6f, 0.3f, 1.0f), "FILTER CONTROLS");
+                }
+                ImGui::Spacing();
+
+                // slider cutoff
+                if (ImGui::SliderInt("Cutoff Frequency (D0)", &dftCutoff, 1, dftMaxCutoff)) {
+                    updateDFTFilter();
+                }
+                ImGui::Spacing();
+
+                // button apply image
+                if (ImGui::Button("Apply to Main Image", ImVec2(200, 40))) {
+                    if (dftProcessed && !dftFiltered.empty()) {
+                        imgProcessed = dftFiltered.clone();
+                        matToTexture(imgProcessed, texProcessed);
+                        cout << "DFT filtered image applied to main view" << endl;
+                    }
+                }
+
+                ImGui::Spacing();
+
+                // close button
+                if (ImGui::Button("Close DFT Window", ImVec2(200, 40))) {
+                    showDFTWindow = false;
+                }
+
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::Spacing();
+
+                //extra information
+                ImGui::Text("Current Cutoff: %d", dftCutoff);
+                ImGui::Text("Higher values = less filtering");
+                ImGui::Text("Lower values = more filtering");
+
+                ImGui::EndChild();
+                ImGui::PopStyleColor();
+
+                ImGui::SameLine();
+
+                // show image
+                if (darkMode) {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+                }
+                else {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                }
+                ImGui::BeginChild("DFT Display", ImVec2(850, 600), true);
+
+                ImGui::Columns(2, "DFTImages", false);
+
+                // orginal image
+                if (darkMode) {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+                }
+                else {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                }
+                ImGui::BeginChild("OriginalDFT", ImVec2(400, 280), true);
+                if (darkMode) {
+                    ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "Original (Grayscale)");
+                }
+                else {
+                    ImGui::TextColored(ImVec4(0.0f, 0.6f, 0.2f, 1.0f), "Original (Grayscale)");
+                }
+                if (!dftOriginal.empty()) {
+                    matToTexture(dftOriginal, texOriginal);
+                    ImGui::Image((void*)(intptr_t)texOriginal, ImVec2(350, 200));
+                }
+                ImGui::EndChild();
+                ImGui::PopStyleColor();
+
+                ImGui::NextColumn();
+
+                // process image 
+                if (darkMode) {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+                }
+                else {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                }
+                ImGui::BeginChild("FilteredDFT", ImVec2(400, 280), true);
+                if (darkMode) {
+                    ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "Filtered Image");
+                }
+                else {
+                    ImGui::TextColored(ImVec4(0.8f, 0.2f, 0.0f, 1.0f), "Filtered Image");
+                }
+                if (dftProcessed && !dftFiltered.empty()) {
+                    ImGui::Image((void*)(intptr_t)texDFTFiltered, ImVec2(350, 200));
+                }
+                ImGui::EndChild();
+                ImGui::PopStyleColor();
+
+                ImGui::Columns(1);
+
+                // DFT spectra
+                ImGui::Spacing();
+                ImGui::Columns(2, "DFTSpectra", false);
+
+                // DFT Spectrum (Before Shift)
+                if (darkMode) {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+                }
+                else {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                }
+                ImGui::BeginChild("DFTBeforeShift", ImVec2(400, 280), true);
+                if (darkMode) {
+                    ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "DFT Spectrum (Before Shift)");
+                }
+                else {
+                    ImGui::TextColored(ImVec4(0.0f, 0.4f, 0.8f, 1.0f), "DFT Spectrum (Before Shift)");
+                }
+                if (texDFTBefore != 0) {
+                    ImGui::Image((void*)(intptr_t)texDFTBefore, ImVec2(350, 200));
+                }
+                ImGui::EndChild();
+                ImGui::PopStyleColor();
+
+                ImGui::NextColumn();
+
+                // DFT Spectrum (After Shift)
+                if (darkMode) {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+                }
+                else {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                }
+                ImGui::BeginChild("DFTAfterShift", ImVec2(400, 280), true);
+                if (darkMode) {
+                    ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "DFT Spectrum (After Shift)");
+                }
+                else {
+                    ImGui::TextColored(ImVec4(0.8f, 0.0f, 0.4f, 1.0f), "DFT Spectrum (After Shift)");
+                }
+                if (texDFTAfter != 0) {
+                    ImGui::Image((void*)(intptr_t)texDFTAfter, ImVec2(350, 200));
+                }
+                ImGui::EndChild();
+                ImGui::PopStyleColor();
+
+                ImGui::Columns(1);
+
+                // How DFT Low-Pass Filter
+                ImGui::Spacing();
+                if (darkMode) {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+                }
+                else {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                }
+                ImGui::BeginChild("DFTExplanation", ImVec2(0, 80), true);
+                if (darkMode) {
+                    ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "How DFT Low-Pass Filter Works:");
+                }
+                else {
+                    ImGui::TextColored(ImVec4(0.0f, 0.5f, 1.0f, 1.0f), "How DFT Low-Pass Filter Works:");
+                }
+                ImGui::BulletText("1. Convert image to frequency domain using DFT");
+                ImGui::BulletText("2. Shift frequency components to center");
+                ImGui::BulletText("3. Apply circular low-pass filter (radius = cutoff)");
+                ImGui::BulletText("4. Shift back and convert to spatial domain using IDFT");
+                ImGui::EndChild();
+                ImGui::PopStyleColor();
+
+                ImGui::EndChild();
+                ImGui::PopStyleColor();
+
+                if (darkMode) {
+                    ImGui::PopStyleColor();
+                }
+            }
+            ImGui::End();
+        }
+
+        // Edge Detection Segmentation Window
+        if (showEdgeSegWindow) {
+            ImGui::SetNextWindowSize(ImVec2(1200, 600), ImGuiCond_FirstUseEver);
+            if (ImGui::Begin("Edge Detection Segmentation", &showEdgeSegWindow,
+                ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize)) {
+
+                if (darkMode) {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+                    ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f),
+                        "Edge Detection Segmentation - Region-based and Threshold-based");
+                }
+                else {
+                    ImGui::TextColored(ImVec4(0.0f, 0.4f, 0.8f, 1.0f),
+                        "Edge Detection Segmentation - Region-based and Threshold-based");
+                }
+                ImGui::Separator();
+
+                if (darkMode) {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+                }
+                else {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                }
+                ImGui::BeginChild("EdgeSegControls", ImVec2(300, 400), true);
+                if (darkMode) {
+                    ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "SEGMENTATION CONTROLS");
+                }
+                else {
+                    ImGui::TextColored(ImVec4(0.0f, 0.6f, 0.3f, 1.0f), "SEGMENTATION CONTROLS");
+                }
+                ImGui::Spacing();
+
+                // Threshold slider
+                if (ImGui::SliderInt("Threshold Value", &edgeThreshold, 0, 255)) {
+                    updateEdgeSegmentation();
+                }
+                ImGui::Spacing();
+
+                // Apply button
+                if (ImGui::Button("Apply to Main Image", ImVec2(200, 40))) {
+                    if (!edgeSegResult.empty()) {
+                        imgProcessed = edgeSegResult.clone();
+                        matToTexture(imgProcessed, texProcessed);
+                        cout << "Edge segmentation applied to main view" << endl;
+                    }
+                }
+
+                ImGui::Spacing();
+
+                // Close button
+                if (ImGui::Button("Close Window", ImVec2(200, 40))) {
+                    showEdgeSegWindow = false;
+                }
+
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::Spacing();
+
+                // Information
+                ImGui::Text("Current Threshold: %d", edgeThreshold);
+                ImGui::Text("Higher values = fewer edges");
+                ImGui::Text("Lower values = more edges");
+
+                ImGui::EndChild();
+                ImGui::PopStyleColor();
+
+                ImGui::SameLine();
+
+                // Image display
+                if (darkMode) {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+                }
+                else {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                }
+                ImGui::BeginChild("EdgeSegDisplay", ImVec2(850, 500), true);
+
+                ImGui::Columns(2, "EdgeSegImages", false);
+
+                // Region-based segmentation
+                if (darkMode) {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+                }
+                else {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                }
+                ImGui::BeginChild("RegionBased", ImVec2(400, 250), true);
+                if (darkMode) {
+                    ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "Region-based Segmentation (Laplacian of Gaussian)");
+                }
+                else {
+                    ImGui::TextColored(ImVec4(0.0f, 0.6f, 0.2f, 1.0f), "Region-based Segmentation (Laplacian of Gaussian)");
+                }
+                if (texRegionSeg != 0) {
+                    ImGui::Image((void*)(intptr_t)texRegionSeg, ImVec2(350, 200));
+                }
+                ImGui::EndChild();
+                ImGui::PopStyleColor();
+
+                ImGui::NextColumn();
+
+                // Threshold-based segmentation
+                if (darkMode) {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+                }
+                else {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                }
+                ImGui::BeginChild("ThresholdBased", ImVec2(400, 250), true);
+                if (darkMode) {
+                    ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "Threshold-based Segmentation");
+                }
+                else {
+                    ImGui::TextColored(ImVec4(0.8f, 0.2f, 0.0f, 1.0f), "Threshold-based Segmentation");
+                }
+                if (texEdgeSeg != 0) {
+                    ImGui::Image((void*)(intptr_t)texEdgeSeg, ImVec2(350, 200));
+                }
+                ImGui::EndChild();
+                ImGui::PopStyleColor();
+
+                ImGui::Columns(1);
+
+                // Explanation
+                ImGui::Spacing();
+                if (darkMode) {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+                }
+                else {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                }
+                ImGui::BeginChild("EdgeSegExplanation", ImVec2(0, 100), true);
+                if (darkMode) {
+                    ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "Segmentation Methods:");
+                }
+                else {
+                    ImGui::TextColored(ImVec4(0.0f, 0.5f, 1.0f, 1.0f), "Segmentation Methods:");
+                }
+                ImGui::BulletText("Region-based: Uses Laplacian of Gaussian (LoG) filter to detect edges");
+                ImGui::BulletText("Threshold-based: Separates foreground/background using intensity threshold");
+                ImGui::EndChild();
+                ImGui::PopStyleColor();
+
+                ImGui::EndChild();
+                ImGui::PopStyleColor();
+
+                if (darkMode) {
+                    ImGui::PopStyleColor();
+                }
+            }
+            ImGui::End();
+        }
+
+        // Huffman Compression Window
+        if (showHuffmanWindow) {
+            ImGui::SetNextWindowSize(ImVec2(1200, 700), ImGuiCond_FirstUseEver);
+            if (ImGui::Begin("Huffman Compression Analysis (Lossless)", &showHuffmanWindow,
+                ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize)) {
+
+                if (darkMode) {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+                    ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f),
+                        "Huffman Compression Analysis (Lossless)");
+                }
+                else {
+                    ImGui::TextColored(ImVec4(0.0f, 0.4f, 0.8f, 1.0f),
+                        "Huffman Compression Analysis (Lossless)");
+                }
+                ImGui::Separator();
+
+                ImGui::Text("Lossless Compression: No quality loss - perfect reconstruction of original image");
+                ImGui::Text("Huffman Coding: Assigns shorter codes to frequent pixel values for efficient compression");
+                ImGui::Separator();
+
+                if (darkMode) {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+                }
+                else {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                }
+                ImGui::BeginChild("HuffmanControls", ImVec2(300, 300), true);
+                if (darkMode) {
+                    ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "COMPRESSION STATUS");
+                }
+                else {
+                    ImGui::TextColored(ImVec4(0.0f, 0.6f, 0.3f, 1.0f), "COMPRESSION STATUS");
+                }
+                ImGui::Spacing();
+
+                ImGui::Text("Compression Type: Lossless");
+                ImGui::Text("Algorithm: Huffman Coding");
+                ImGui::Text("Quality: Perfect (No loss)");
+                ImGui::Spacing();
+
+                if (ImGui::Button("Apply to Main Image", ImVec2(200, 40))) {
+                    if (!huffmanImage.empty()) {
+                        imgProcessed = huffmanImage.clone();
+                        matToTexture(imgProcessed, texProcessed);
+                        cout << "Huffman compressed image applied to main view" << endl;
+                    }
+                }
+
+                ImGui::Spacing();
+
+                if (ImGui::Button("Close Huffman Window", ImVec2(200, 40))) {
+                    showHuffmanWindow = false;
+                }
+
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::Spacing();
+
+                ImGui::Text("Current Status:");
+                if (!huffmanImage.empty()) {
+                    ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "Compression Applied");
+                }
+                else {
+                    ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.0f, 1.0f), "No Compression Yet");
+                    ImGui::Text("Go to 'Image Enhancement' tab");
+                    ImGui::Text("and click 'Huffman Compression'");
+                }
+
+                ImGui::EndChild();
+                ImGui::PopStyleColor();
+
+                ImGui::SameLine();
+
+                if (darkMode) {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+                }
+                else {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                }
+                ImGui::BeginChild("HuffmanDisplay", ImVec2(850, 600), true);
+
+                ImGui::Columns(2, "HuffmanDisplay", false);
+
+                if (darkMode) {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+                }
+                else {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                }
+                ImGui::BeginChild("CompressedHuffman", ImVec2(400, 280), true);
+                if (darkMode) {
+                    ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "Compressed Image (Lossless)");
+                }
+                else {
+                    ImGui::TextColored(ImVec4(0.8f, 0.2f, 0.0f, 1.0f), "Compressed Image (Lossless)");
+                }
+                if (!huffmanImage.empty()) {
+                    ImGui::SetCursorPosX(25);
+                    ImGui::Image((void*)(intptr_t)texHuffman, ImVec2(350, 200));
+                    ImGui::SetCursorPosX(150);
+                    ImGui::Text("Perfect Reconstruction");
+                    ImGui::SetCursorPosX(140);
+                    ImGui::Text("(Identical to Original)");
+                }
+                else {
+                    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 80);
+                    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 120);
+                    if (darkMode) {
+                        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "No compression applied");
+                    }
+                    else {
+                        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "No compression applied");
+                    }
+                }
+                ImGui::EndChild();
+                ImGui::PopStyleColor();
+
+                ImGui::Columns(1);
+
+                ImGui::Spacing();
+                ImGui::Columns(2, "HuffmanMetrics", false);
+
+                if (darkMode) {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+                }
+                else {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                }
+                ImGui::BeginChild("CompressionMetrics", ImVec2(400, 280), true);
+                if (darkMode) {
+                    ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "Compression Metrics");
+                }
+                else {
+                    ImGui::TextColored(ImVec4(0.0f, 0.4f, 0.8f, 1.0f), "Compression Metrics");
+                }
+
+                if (!huffmanImage.empty()) {
+                    ImGui::Spacing();
+                    ImGui::Text("Original Size: %.0f bytes", huffmanMetrics.originalSize);
+                    ImGui::Text("Compressed Size: %.2f bytes", huffmanMetrics.compressedSize);
+                    ImGui::Text("Compression Ratio: %.2f : 1", huffmanMetrics.cr);
+                    ImGui::Text("RMSE: %.6f (Lossless)", huffmanMetrics.rmse);
+                    ImGui::Text("PSNR: %.2f dB", huffmanMetrics.psnr);
+
+                    double spaceSaved = 0;
+                    if (huffmanMetrics.originalSize > 0) {
+                        spaceSaved = (1.0 - (huffmanMetrics.compressedSize / huffmanMetrics.originalSize)) * 100.0;
+                    }
+
+                    ImGui::Spacing();
+                    ImGui::Separator();
+                    ImGui::Spacing();
+
+                    if (spaceSaved > 0) {
+                        ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "Space Saved: %.1f%%", spaceSaved);
+                        if (spaceSaved > 30) {
+                            ImGui::TextColored(ImVec4(0.0f, 0.8f, 0.0f, 1.0f), "Excellent Compression!");
+                        }
+                        else if (spaceSaved > 10) {
+                            ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.0f, 1.0f), "Good Compression");
+                        }
+                        else {
+                            ImGui::TextColored(ImVec4(0.8f, 0.5f, 0.0f, 1.0f), "Moderate Compression");
+                        }
+                    }
+                    else {
+                        ImGui::TextColored(ImVec4(1.0f, 0.0f, 0.0f, 1.0f), "No Compression Achieved");
+                    }
+                }
+                else {
+                    ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 80);
+                    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 100);
+                    if (darkMode) {
+                        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Apply compression to see metrics");
+                    }
+                    else {
+                        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Apply compression to see metrics");
+                    }
+                }
+
+                ImGui::EndChild();
+                ImGui::PopStyleColor();
+
+                ImGui::NextColumn();
+
+                if (darkMode) {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+                }
+                else {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                }
+                ImGui::BeginChild("HuffmanExplanation", ImVec2(400, 280), true);
+                if (darkMode) {
+                    ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "How Huffman Compression Works:");
+                }
+                else {
+                    ImGui::TextColored(ImVec4(0.8f, 0.0f, 0.4f, 1.0f), "How Huffman Compression Works:");
+                }
+                ImGui::BulletText("1. Analyze pixel frequency in the image");
+                ImGui::BulletText("2. Build Huffman tree (frequent pixels get shorter codes)");
+                ImGui::BulletText("3. Assign variable-length codes to each pixel value");
+                ImGui::BulletText("4. Encode image using these codes");
+                ImGui::BulletText("5. Store codes + encoded data for decompression");
+                ImGui::BulletText("6. Perfect reconstruction - no quality loss");
+
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::Spacing();
+
+                ImGui::Text("Advantages:");
+                ImGui::BulletText("Lossless compression (no quality loss)");
+                ImGui::BulletText("Efficient for images with repetitive patterns");
+                ImGui::BulletText("Simple and widely used algorithm");
+
+                ImGui::EndChild();
+                ImGui::PopStyleColor();
+
+                ImGui::Columns(1);
+
+                ImGui::EndChild();
+                ImGui::PopStyleColor();
+
+                if (darkMode) {
+                    ImGui::PopStyleColor();
+                }
+            }
+            ImGui::End();
+        }
+
+        // Lossy Compression Window
+        if (showLossyWindow) {
+            ImGui::SetNextWindowSize(ImVec2(1000, 600), ImGuiCond_FirstUseEver);
+            if (ImGui::Begin("Lossy Compression (DCT) Analysis", &showLossyWindow,
+                ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize)) {
+
+                if (darkMode) {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+                    ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f),
+                        "Lossy Compression (DCT) Analysis");
+                }
+                else {
+                    ImGui::TextColored(ImVec4(0.0f, 0.4f, 0.8f, 1.0f),
+                        "Lossy Compression (DCT) Analysis");
+                }
+                ImGui::Separator();
+
+                // Lossy compression controls
+                if (darkMode) {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+                }
+                else {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                }
+                ImGui::BeginChild("LossyControls", ImVec2(300, 500), true);
+
+                if (darkMode) {
+                    ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "COMPRESSION SETTINGS");
+                }
+                else {
+                    ImGui::TextColored(ImVec4(0.0f, 0.6f, 0.3f, 1.0f), "COMPRESSION SETTINGS");
+                }
+                ImGui::Spacing();
+
+                // DCT Quality slider
+                ImGui::Text("DCT Compression Quality:");
+                if (ImGui::SliderFloat("Quality %", &dctQuality, 1.0f, 100.0f, "%.1f")) {
+                    // Update compression if needed
+                }
+
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::Spacing();
+
+                // Apply button
+                if (ImGui::Button("Apply DCT Compression", ImVec2(250, 50))) {
+                    fn_LossyCompression();
+                }
+
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::Spacing();
+
+                // Close button
+                if (ImGui::Button("Close Window", ImVec2(250, 40))) {
+                    showLossyWindow = false;
+                }
+
+                ImGui::EndChild();
+                ImGui::PopStyleColor();
+
+                ImGui::SameLine();
+
+                // Lossy compression results display
+                if (darkMode) {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+                }
+                else {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                }
+                ImGui::BeginChild("LossyResults", ImVec2(650, 500), true);
+
+                // Show lossy compressed image
+                if (!lossyImage.empty()) {
+                    ImGui::Text("DCT Compressed Image:");
+                    ImGui::SetCursorPosX((ImGui::GetWindowWidth() - 400) / 2);
+                    ImGui::Image((void*)(intptr_t)texLossy, ImVec2(400, 300));
+
+                    // Calculate compression metrics
+                    double cr, rmse, psnr;
+                    Mat originalGray;
+
+                    if (imgOriginal.channels() == 3 || imgOriginal.channels() == 4) {
+                        cvtColor(imgOriginal, originalGray, COLOR_BGR2GRAY);
+                    }
+                    else {
+                        originalGray = imgOriginal.clone();
+                    }
+
+                    calculateCompressionMetrics(originalGray, lossyImage, cr, rmse, psnr);
+
+                    ImGui::Spacing();
+                    ImGui::Separator();
+                    ImGui::Spacing();
+
+                    ImGui::Text("Compression Metrics:");
+                    ImGui::Text("Compression Ratio (CR): %.2f:1", cr);
+                    ImGui::Text("Root Mean Square Error (RMSE): %.4f", rmse);
+                    ImGui::Text("Peak Signal-to-Noise Ratio (PSNR): %.2f dB", psnr);
+
+                    // Quality interpretation
+                    ImGui::Spacing();
+                    ImGui::Separator();
+                    ImGui::Spacing();
+
+                    if (psnr > 40) {
+                        ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "Excellent Quality (PSNR > 40 dB)");
+                    }
+                    else if (psnr > 30) {
+                        ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.0f, 1.0f), "Good Quality (PSNR > 30 dB)");
+                    }
+                    else {
+                        ImGui::TextColored(ImVec4(1.0f, 0.0f, 0.0f, 1.0f), "Poor Quality (PSNR < 30 dB)");
+                    }
+
+                    ImGui::Spacing();
+                    ImGui::Separator();
+                    ImGui::Spacing();
+
+                    ImGui::Text("How DCT Compression Works:");
+                    ImGui::BulletText("1. Divide image into 8x8 blocks");
+                    ImGui::BulletText("2. Apply Discrete Cosine Transform (DCT) to each block");
+                    ImGui::BulletText("3. Quantize DCT coefficients (higher compression = more quantization)");
+                    ImGui::BulletText("4. Apply Inverse DCT to reconstruct image");
+                }
+                else {
+                    ImGui::Text("No DCT compressed image available");
+                    ImGui::Text("Adjust quality and click 'Apply DCT Compression'");
+                }
+
+                ImGui::EndChild();
+                ImGui::PopStyleColor();
+
+                if (darkMode) {
+                    ImGui::PopStyleColor();
+                }
+            }
+            ImGui::End();
+        }
+
+        // Crop Window
+        if (showCropWindow) {
+            ImGui::SetNextWindowSize(ImVec2(1000, 600), ImGuiCond_FirstUseEver);
+            if (ImGui::Begin("Image Cropping Tool", &showCropWindow,
+                ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize)) {
+
+                if (darkMode) {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+                    ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f),
+                        "Image Cropping Tool");
+                }
+                else {
+                    ImGui::TextColored(ImVec4(0.0f, 0.4f, 0.8f, 1.0f),
+                        "Image Cropping Tool");
+                }
+                ImGui::Separator();
+
+                // Crop controls
+                if (darkMode) {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+                }
+                else {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                }
+                ImGui::BeginChild("CropControls", ImVec2(300, 500), true);
+
+                if (darkMode) {
+                    ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "CROP SETTINGS");
+                }
+                else {
+                    ImGui::TextColored(ImVec4(0.0f, 0.6f, 0.3f, 1.0f), "CROP SETTINGS");
+                }
+                ImGui::Spacing();
+
+                // Crop sliders
+                ImGui::Text("Crop Position:");
+                if (ImGui::SliderFloat("X Position %", &cropX, 0.0f, 100.0f, "%.1f")) {
+                    updateCropPreview();
+                }
+                if (ImGui::SliderFloat("Y Position %", &cropY, 0.0f, 100.0f, "%.1f")) {
+                    updateCropPreview();
+                }
+
+                ImGui::Spacing();
+                ImGui::Text("Crop Size:");
+                if (ImGui::SliderFloat("Width %", &cropWidth, 1.0f, 100.0f, "%.1f")) {
+                    updateCropPreview();
+                }
+                if (ImGui::SliderFloat("Height %", &cropHeight, 1.0f, 100.0f, "%.1f")) {
+                    updateCropPreview();
+                }
+
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::Spacing();
+
+                // Crop button
+                if (ImGui::Button("Apply Crop", ImVec2(250, 50))) {
+                    fn_CropImage();
+                }
+
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::Spacing();
+
+                // Close button
+                if (ImGui::Button("Close Window", ImVec2(250, 40))) {
+                    showCropWindow = false;
+                }
+
+                ImGui::EndChild();
+                ImGui::PopStyleColor();
+
+                ImGui::SameLine();
+
+                // Crop preview display
+                if (darkMode) {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+                }
+                else {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                }
+                ImGui::BeginChild("CropPreview", ImVec2(650, 500), true);
+
+                // Show preview with crop rectangle
+                if (!imgOriginal.empty()) {
+                    ImGui::Text("Crop Preview (Green rectangle shows crop area):");
+                    ImGui::SetCursorPosX((ImGui::GetWindowWidth() - 400) / 2);
+                    ImGui::Image((void*)(intptr_t)texProcessed, ImVec2(400, 300));
+
+                    // Calculate actual crop dimensions
+                    int x = (int)(cropX / 100.0f * imgOriginal.cols);
+                    int y = (int)(cropY / 100.0f * imgOriginal.rows);
+                    int width = (int)(cropWidth / 100.0f * imgOriginal.cols);
+                    int height = (int)(cropHeight / 100.0f * imgOriginal.rows);
+
+                    ImGui::Spacing();
+                    ImGui::Separator();
+                    ImGui::Spacing();
+
+                    ImGui::Text("Crop Dimensions:");
+                    ImGui::Text("X: %d pixels (%.1f%%)", x, cropX);
+                    ImGui::Text("Y: %d pixels (%.1f%%)", y, cropY);
+                    ImGui::Text("Width: %d pixels (%.1f%%)", width, cropWidth);
+                    ImGui::Text("Height: %d pixels (%.1f%%)", height, cropHeight);
+                    ImGui::Text("Original Size: %d x %d", imgOriginal.cols, imgOriginal.rows);
+                    ImGui::Text("Cropped Size: %d x %d", width, height);
+                }
+
+                ImGui::EndChild();
+                ImGui::PopStyleColor();
+
+                if (darkMode) {
+                    ImGui::PopStyleColor();
+                }
+            }
+            ImGui::End();
+        }
+
+        // Main window with professional design
+        ImGui::SetNextWindowPos(ImVec2(0, 0));
+        ImGui::SetNextWindowSize(io.DisplaySize);
+        ImGui::Begin("Image Processing", nullptr,
+            ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+            ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoBringToFrontOnFocus);
+
+        //HEADER SECTION
+        if (darkMode) {
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+        }
+        else {
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.96f, 0.96f, 0.96f, 1.0f));
+        }
+        ImGui::BeginChild("Header", ImVec2(0, 80), true);
+
+        ImGui::Columns(3, "HeaderColumns", false);
+
+        // Main title
+        ImGui::SetColumnWidth(0, 400);
+        ImGui::PushFont(io.Fonts->Fonts[0]);
+        if (darkMode) {
+            ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "DEMO_AH");
+        }
+        else {
+            ImGui::TextColored(ImVec4(0.0f, 0.0f, 0.0f, 1.0f), "DEMO_AH");
+        }
+        ImGui::PopFont();
+        if (darkMode) {
+            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Computer Vision Toolbox");
+        }
+        else {
+            ImGui::TextColored(ImVec4(0.3f, 0.3f, 0.3f, 1.0f), "Computer Vision Toolbox");
+        }
+
+        // Theme toggle button
+        ImGui::NextColumn();
+        ImGui::SetColumnWidth(1, 400);
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 100);
+        if (ImGui::Button(darkMode ? "Light Mode" : "Dark Mode", ImVec2(140, 35))) {
+            darkMode = !darkMode;
+            if (darkMode) ApplyDarkTheme();
+            else ApplyLightTheme();
+        }
+
+        // Student information
+        ImGui::NextColumn();
+        ImGui::SetColumnWidth(2, 400);
+        if (darkMode) {
+            ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.0f, 1.0f), "Student: Ahmed Hisham Ezzat");
+            ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.0f, 1.0f), "ID: 4220008");
+        }
+        else {
+            ImGui::TextColored(ImVec4(0.0f, 0.4f, 0.8f, 1.0f), "Student: Ahmed Hisham Ezzat");
+            ImGui::TextColored(ImVec4(0.0f, 0.4f, 0.8f, 1.0f), "ID: 4220008");
+        }
+
+        ImGui::Columns(1);
+        ImGui::EndChild();
+        ImGui::PopStyleColor();
+
+        ImGui::Spacing();
+
+        //MAIN CONTROLS SECTION
+        if (darkMode) {
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+        }
+        else {
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+        }
+        ImGui::BeginChild("MainControls", ImVec2(0, 120), true);
+
+        // Top control bar
+        ImGui::Columns(6, "ControlButtons", false);
+
+        // Image loading group
+        if (darkMode) {
+            ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1.0f), "IMAGE CONTROLS");
+        }
+        else {
+            ImGui::TextColored(ImVec4(0.0f, 0.6f, 0.2f, 1.0f), "IMAGE CONTROLS");
+        }
+        if (ImGui::Button("Upload Image", ImVec2(140, 45))) {
+            if (loadImageFromDialog(imgOriginal)) {
+                matToTexture(imgOriginal, texOriginal);
+                matToTexture(imgProcessed, texProcessed);
+            }
+        }
+        if (darkMode) {
+            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Load new image");
+        }
+        else {
+            ImGui::Text("Load new image");
+        }
+
+        ImGui::NextColumn();
+
+        // Save image group
+        if (darkMode) {
+            ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.9f, 1.0f), "SAVE IMAGE");
+        }
+        else {
+            ImGui::TextColored(ImVec4(0.0f, 0.6f, 0.6f, 1.0f), "SAVE IMAGE");
+        }
+        if (ImGui::Button("Save Image", ImVec2(140, 45))) {
+            if (!imgProcessed.empty()) {
+                saveImageToDialog(imgProcessed);
+            }
+            else if (!imgOriginal.empty()) {
+                saveImageToDialog(imgOriginal);
+            }
+            else {
+                cout << "Error: No image to save" << endl;
+            }
+        }
+        if (darkMode) {
+            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Save processed image");
+        }
+        else {
+            ImGui::Text("Save processed image");
+        }
+
+        ImGui::NextColumn();
+
+        // Processing group
+        if (darkMode) {
+            ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.3f, 1.0f), "PROCESSING");
+        }
+        else {
+            ImGui::TextColored(ImVec4(0.8f, 0.4f, 0.0f, 1.0f), "PROCESSING");
+        }
+        ImGui::Button("Reset", ImVec2(90, 45));
+        if (ImGui::IsItemClicked()) {
+            imgProcessed = imgOriginal.clone();
+            matToTexture(imgProcessed, texProcessed);
+        }
+        ImGui::SameLine();
+        ImGui::Button("Undo", ImVec2(90, 45));
+        if (ImGui::IsItemClicked()) {
+            undoLast();
+            matToTexture(imgProcessed, texProcessed);
+        }
+        if (darkMode) {
+            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Reset & Undo");
+        }
+        else {
+            ImGui::Text("Reset & Undo");
+        }
+
+        ImGui::NextColumn();
+
+        // Information group
+        if (darkMode) {
+            ImGui::TextColored(ImVec4(0.5f, 0.7f, 1.0f, 1.0f), "ANALYSIS");
+        }
+        else {
+            ImGui::TextColored(ImVec4(0.0f, 0.4f, 0.8f, 1.0f), "ANALYSIS");
+        }
+        if (ImGui::Button("Image Info", ImVec2(140, 45))) {
+            fn_Image_Info();
+        }
+        if (darkMode) {
+            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Show detailed info");
+        }
+        else {
+            ImGui::Text("Show detailed info");
+        }
+
+        ImGui::NextColumn();
+
+        // Help group
+        if (darkMode) {
+            ImGui::TextColored(ImVec4(0.9f, 0.5f, 0.9f, 1.0f), "CONTROLS");
+        }
+        else {
+            ImGui::TextColored(ImVec4(0.6f, 0.0f, 0.6f, 1.0f), "CONTROLS");
+        }
+        if (darkMode) {
+            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Zoom: Mouse Wheel");
+            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Flip: X, Y, Z Keys");
+        }
+        else {
+            ImGui::Text("Zoom: Mouse Wheel");
+            ImGui::Text("Flip: X, Y, Z Keys");
+        }
+
+        ImGui::NextColumn();
+        //Help button
+        if (darkMode) {
+            ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.3f, 1.0f), "HELP");
+        }
+        else {
+            ImGui::TextColored(ImVec4(0.8f, 0.2f, 0.0f, 1.0f), "HELP");
+        }
+        if (ImGui::Button("Help Guide", ImVec2(140, 45))) {
+            showHelpWindow = true;
+        }
+        if (darkMode) {
+            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Show help guide");
+        }
+        else {
+            ImGui::Text("Show help guide");
+        }
+
+        ImGui::Columns(1);
+        ImGui::EndChild();
+        ImGui::PopStyleColor();
+
+        ImGui::Spacing();
+
+        //MAIN CONTENT SECTION 
+        if (ImGui::BeginTabBar("MainTabs", ImGuiTabBarFlags_None)) {
+
+            // Transformations tab
+            if (ImGui::BeginTabItem("Geometric Transformations")) {
+                ImGui::Spacing();
+
+                ImGui::Columns(2, "TransformColumns", true);
+
+                // Transform controls
+                if (darkMode) {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+                }
+                else {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                }
+                ImGui::BeginChild("TransformControls", ImVec2(0, 350), true);
+                if (darkMode) {
+                    ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "REAL-TIME CONTROLS");
+                }
+                else {
+                    ImGui::TextColored(ImVec4(0.0f, 0.0f, 0.0f, 1.0f), "REAL-TIME CONTROLS");
+                }
+
+                ImGui::Checkbox("Enable Real-time Preview", &realTimeTransform);
+                ImGui::Spacing();
+
+                ImGui::Text("Zoom Control");
+                ImGui::SliderFloat("Scale", &zoomScale, 0.1f, 5.0f, "%.2fx");
+                ImGui::Text("Use Mouse Wheel for smooth zoom");
+
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::Spacing();
+
+                ImGui::Text("Rotation Control");
+                ImGui::SliderFloat("Angle", &rotateAngle, -180.0f, 180.0f, "%.1f degrees");
+
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::Spacing();
+
+                ImGui::Text("Translation Control");
+                ImGui::SliderFloat("Move X", &transX, -200.0f, 200.0f, "%.1f px");
+                ImGui::SliderFloat("Move Y", &transY, -200.0f, 200.0f, "%.1f px");
+
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::Spacing();
+
+                // control skew
+                ImGui::Text("Skew Control");
+                ImGui::SliderFloat("Skew X", &skewX, -100.0f, 100.0f, "%.1f px");
+                ImGui::SliderFloat("Skew Y", &skewY, -100.0f, 100.0f, "%.1f px");
+
+                ImGui::EndChild();
+                ImGui::PopStyleColor();
+
+                ImGui::NextColumn();
+
+                // Quick transform buttons
+                if (darkMode) {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+                }
+                else {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                }
+                ImGui::BeginChild("QuickTransforms", ImVec2(0, 350), true);
+                if (darkMode) {
+                    ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "QUICK TRANSFORMS");
+                }
+                else {
+                    ImGui::TextColored(ImVec4(0.0f, 0.0f, 0.0f, 1.0f), "QUICK TRANSFORMS");
+                }
+
+                ImGui::Spacing();
+                if (ImGui::Button("Apply Rotation", ImVec2(160, 45))) fn_Rotation(rotateAngle);
+                ImGui::SameLine();
+                if (ImGui::Button("Apply Translation", ImVec2(160, 45))) fn_Translation(transX, transY);
+
+                ImGui::Spacing();
+                if (ImGui::Button("Apply Zoom", ImVec2(160, 45))) fn_Zoom(zoomScale);
+                ImGui::SameLine();
+                if (ImGui::Button("Apply Skew", ImVec2(160, 45))) fn_Skew(skewX, skewY);
+
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::Spacing();
+
+                if (darkMode) {
+                    ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "FLIP OPERATIONS");
+                }
+                else {
+                    ImGui::TextColored(ImVec4(0.0f, 0.0f, 0.0f, 1.0f), "FLIP OPERATIONS");
+                }
+                ImGui::Text("Use Keyboard: X, Y, Z keys");
+
+                ImGui::Spacing();
+                ImGui::Button("Flip X (X Key)", ImVec2(170, 40));
+                if (ImGui::IsItemClicked()) fn_FlipX();
+                ImGui::SameLine();
+                ImGui::Button("Flip Y (Y Key)", ImVec2(170, 40));
+                if (ImGui::IsItemClicked()) fn_FlipY();
+                ImGui::SameLine();
+                ImGui::Button("Flip XY (Z Key)", ImVec2(170, 40));
+                if (ImGui::IsItemClicked()) fn_FlipXY();
+
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::Spacing();
+
+                // CROP BUTTON MOVED HERE
+                if (darkMode) {
+                    ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "CROP OPERATION");
+                }
+                else {
+                    ImGui::TextColored(ImVec4(0.0f, 0.0f, 0.0f, 1.0f), "CROP OPERATION");
+                }
+                if (ImGui::Button("Crop Image Tool", ImVec2(200, 45))) {
+                    showCropWindow = true;
+                    updateCropPreview();
+                }
+                ImGui::Text("Select and crop region of interest");
+
+                ImGui::EndChild();
+                ImGui::PopStyleColor();
+
+                ImGui::Columns(1);
+                ImGui::EndTabItem();
+            }
+
+            // Enhancement tab
+            if (ImGui::BeginTabItem("Image Enhancement")) {
+                ImGui::Spacing();
+
+                ImGui::Columns(2, "EnhanceColumns", true);
+
+                // Color enhancements
+                if (darkMode) {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+                }
+                else {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                }
+                ImGui::BeginChild("ColorEnhancement", ImVec2(0, 250), true);
+                if (darkMode) {
+                    ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "COLOR ENHANCEMENT");
+                }
+                else {
+                    ImGui::TextColored(ImVec4(0.0f, 0.0f, 0.0f, 1.0f), "COLOR ENHANCEMENT");
+                }
+
+                if (ImGui::Button("Negative", ImVec2(130, 40))) fn_Negative();
+                ImGui::SameLine();
+                if (ImGui::Button("Log Transform", ImVec2(130, 40))) fn_LogTransform();
+                ImGui::Spacing();
+                ImGui::Text("Gamma Correction:");
+                ImGui::InputText("Value", gammaInput, 8);
+                if (ImGui::Button("Apply Gamma", ImVec2(130, 40))) fn_GammaCorrection(atof(gammaInput));
+
+                ImGui::EndChild();
+                ImGui::PopStyleColor();
+
+                // Slicing enhancements
+                if (darkMode) {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+                }
+                else {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                }
+                ImGui::BeginChild("SliceEnhancement", ImVec2(0, 250), true);
+                if (darkMode) {
+                    ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "SLICING OPERATIONS");
+                }
+                else {
+                    ImGui::TextColored(ImVec4(0.0f, 0.0f, 0.0f, 1.0f), "SLICING OPERATIONS");
+                }
+
+                ImGui::Text("Bit-plane Slicing:");
+                ImGui::SliderInt("Bit Level", &selectedBitPlane, 0, 7);
+                if (ImGui::Button("Apply Bit-plane", ImVec2(170, 40))) fn_BitPlaneSlicing(selectedBitPlane);
+                ImGui::SameLine();
+                if (ImGui::Button("Enhanced Bit-plane", ImVec2(170, 40))) fn_BitPlaneSlicingEnhanced();
+
+                ImGui::Spacing();
+                ImGui::Text("Gray-level Slicing:");
+                ImGui::SliderInt("Lower", &grayLower, 0, 255);
+                ImGui::SliderInt("Upper", &grayUpper, 0, 255);
+                if (ImGui::Button("Apply Gray-level", ImVec2(170, 40))) fn_GrayLevelSlicing(grayLower, grayUpper);
+
+                ImGui::EndChild();
+                ImGui::PopStyleColor();
+
+                ImGui::NextColumn();
+
+                // Advanced effects
+                if (darkMode) {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+                }
+                else {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                }
+                ImGui::BeginChild("AdvancedEffects", ImVec2(0, 370), true);
+                if (darkMode) {
+                    ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "ADVANCED EFFECTS");
+                }
+                else {
+                    ImGui::TextColored(ImVec4(0.0f, 0.0f, 0.0f, 1.0f), "ADVANCED EFFECTS");
+                }
+
+                if (ImGui::Button("Add Noise", ImVec2(150, 45))) fn_AddNoise();
+                ImGui::Text("Adds realistic noise to image (preserves format)");
+
+                ImGui::Spacing();
+                if (ImGui::Button("Canny Edge Detection", ImVec2(220, 45))) fn_Canny();
+                ImGui::Text("Detects edges in the image");
+
+                ImGui::Spacing();
+                if (ImGui::Button("RGB to Grayscale", ImVec2(170, 45))) fn_RGB_to_Gray();
+                ImGui::Text("Convert color image to grayscale");
+
+                ImGui::Spacing();
+                if (ImGui::Button("DFT Low-Pass Filter", ImVec2(190, 45))) fn_DFTLowPassFilter();
+                ImGui::Text("Frequency domain filtering");
+
+                ImGui::Spacing();
+                if (ImGui::Button("Edge Detection Segmentation", ImVec2(280, 45))) fn_EdgeDetectionSegmentation();
+                ImGui::Text("Region and threshold-based segmentation");
+
+                // SEPARATE COMPRESSION BUTTONS
+                ImGui::Spacing();
+                if (ImGui::Button("Huffman Compression", ImVec2(220, 45))) {
+                    fn_HuffmanCompression();
+                }
+                ImGui::Text("Lossless compression using Huffman coding");
+
+                ImGui::Spacing();
+                if (ImGui::Button("Lossy Compression (DCT)", ImVec2(230, 45))) {
+                    fn_LossyCompression();
+                }
+                ImGui::Text("DCT-based lossy compression");
+
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::Spacing();
+
+                // Morphological Operations
+                if (darkMode) {
+                    ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "MORPHOLOGICAL OPERATIONS");
+                }
+                else {
+                    ImGui::TextColored(ImVec4(0.0f, 0.0f, 0.0f, 1.0f), "MORPHOLOGICAL OPERATIONS");
+                }
+
+                // Min, Max, Median Filters (Min renamed to Smooth)
+                ImGui::Text("Statistical Filters:");
+                if (ImGui::Button("min Filter", ImVec2(130, 40))) fn_SmoothFilter();
+                ImGui::SameLine();
+                if (ImGui::Button("Max Filter", ImVec2(130, 40))) fn_MaxFilter();
+                ImGui::SameLine();
+                if (ImGui::Button("Median Filter", ImVec2(130, 40))) fn_MedianFilter();
+
+                ImGui::Spacing();
+
+                // Basic Morphological Operations
+                ImGui::Text("Basic Morphology:");
+                if (ImGui::Button("Erosion", ImVec2(130, 40))) fn_Erosion();
+                ImGui::SameLine();
+                if (ImGui::Button("Dilation", ImVec2(130, 40))) fn_Dilation();
+
+                ImGui::Spacing();
+
+                // Compound Morphological Operations
+                ImGui::Text("Compound Morphology:");
+                if (ImGui::Button("Opening", ImVec2(130, 40))) fn_Opening();
+                ImGui::SameLine();
+                if (ImGui::Button("Closing", ImVec2(130, 40))) fn_Closing();
+
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::Spacing();
+
+                // HISTOGRAM FUNCTIONS
+                if (darkMode) {
+                    ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "HISTOGRAM ANALYSIS");
+                }
+                else {
+                    ImGui::TextColored(ImVec4(0.0f, 0.0f, 0.0f, 1.0f), "HISTOGRAM ANALYSIS");
+                }
+                if (ImGui::Button("Histogram Equalization", ImVec2(190, 40))) fn_HistogramEqualization();
+                ImGui::SameLine();
+                if (ImGui::Button("Object Detection", ImVec2(190, 40))) fn_ObjectDetection();
+
+                ImGui::Spacing();
+                if (ImGui::Button("Histogram Analysis", ImVec2(190, 40))) fn_HistogramAnalysis();
+
+                ImGui::EndChild();
+                ImGui::PopStyleColor();
+
+                ImGui::Columns(1);
+                ImGui::EndTabItem();
+            }
+
+            // Filters tab
+            if (ImGui::BeginTabItem("Advanced Filters")) {
+                ImGui::Spacing();
+
+                ImGui::Columns(2, "FilterColumns", true);
+
+                // Filter list
+                if (darkMode) {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+                }
+                else {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                }
+                ImGui::BeginChild("FilterList", ImVec2(0, 250), true);
+                if (darkMode) {
+                    ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "FILTER SELECTION");
+                }
+                else {
+                    ImGui::TextColored(ImVec4(0.0f, 0.0f, 0.0f, 1.0f), "FILTER SELECTION");
+                }
+
+                for (int i = 0; i < filterNames.size(); i++) {
+                    if (ImGui::Selectable(filterNames[i].c_str(), selectedFilter == i)) {
+                        selectedFilter = i;
+                    }
+                }
+
+                ImGui::Spacing();
+                if (ImGui::Button("Apply Selected Filter", ImVec2(190, 45))) {
+                    switch (selectedFilter) {
+                    case 0: fn_TraditionalFilter(); break;
+                    case 1: fn_PyramidalFilter(); break;
+                    case 2: fn_CircularFilter(); break;
+                    case 3: fn_ConeFilter(); break;
+                    case 4: fn_LaplacianFilter(); break;
+                    case 5: fn_SobelFilter(); break;
+                    case 6: fn_SobelHorizontal(); break;
+                    case 7: fn_SobelVertical(); break;
+                    case 8: fn_SobelDiagonal(); break;
+                    }
+                }
+
+                ImGui::EndChild();
+                ImGui::PopStyleColor();
+
+                // Filter information
+                if (darkMode) {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+                }
+                else {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                }
+                ImGui::BeginChild("FilterInfo", ImVec2(0, 200), true);
+                if (darkMode) {
+                    ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "FILTER INFORMATION");
+                }
+                else {
+                    ImGui::TextColored(ImVec4(0.0f, 0.0f, 0.0f, 1.0f), "FILTER INFORMATION");
+                }
+
+                vector<string> filterDescriptions = {
+                    "Traditional 3x3 averaging filter for basic noise reduction",
+                    "Pyramidal filter for smooth transitions and edge preservation",
+                    "Circular filter for circular symmetry and pattern enhancement",
+                    "Cone filter for 3D cone effect and depth perception",
+                    "Laplacian filter for edge detection using second derivatives",
+                    "Sobel filter for multi-directional edge detection",
+                    "Sobel Horizontal filter for detecting horizontal edges",
+                    "Sobel Vertical filter for detecting vertical edges",
+                    "Sobel Diagonal filter for detecting diagonal edges"
+                };
+
+                ImGui::TextWrapped("%s", filterDescriptions[selectedFilter].c_str());
+                ImGui::EndChild();
+                ImGui::PopStyleColor();
+
+                ImGui::NextColumn();
+
+                // Filter preview
+                if (darkMode) {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+                }
+                else {
+                    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+                }
+                ImGui::BeginChild("FilterPreview", ImVec2(0, 470), true);
+                if (darkMode) {
+                    ImGui::TextColored(ImVec4(1.0f, 1.0f, 1.0f, 1.0f), "QUICK FILTER APPLY");
+                }
+                else {
+                    ImGui::TextColored(ImVec4(0.0f, 0.0f, 0.0f, 1.0f), "QUICK FILTER APPLY");
+                }
+
+                // Quick apply buttons 
+                ImGui::Text("Smooth Filters:");
+                ImGui::Spacing();
+
+                if (ImGui::Button("Traditional", ImVec2(110, 40))) fn_TraditionalFilter();
+                ImGui::SameLine();
+                if (ImGui::Button("Pyramidal", ImVec2(110, 40))) fn_PyramidalFilter();
+
+                ImGui::Spacing();
+                if (ImGui::Button("Circular", ImVec2(110, 40))) fn_CircularFilter();
+                ImGui::SameLine();
+                if (ImGui::Button("Cone", ImVec2(110, 40))) fn_ConeFilter();
+
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::Spacing();
+
+                // Quick apply buttons 
+                ImGui::Text("Edge Detection Filters:");
+                ImGui::Spacing();
+
+                if (ImGui::Button("Laplacian", ImVec2(110, 40))) fn_LaplacianFilter();
+                ImGui::SameLine();
+                if (ImGui::Button("Sobel Full", ImVec2(110, 40))) fn_SobelFilter();
+
+                ImGui::Spacing();
+                if (ImGui::Button("Sobel H", ImVec2(90, 40))) fn_SobelHorizontal();
+                ImGui::SameLine();
+                if (ImGui::Button("Sobel V", ImVec2(90, 40))) fn_SobelVertical();
+                ImGui::SameLine();
+                if (ImGui::Button("Sobel D", ImVec2(90, 40))) fn_SobelDiagonal();
+
+                ImGui::EndChild();
+                ImGui::PopStyleColor();
+
+                ImGui::Columns(1);
+                ImGui::EndTabItem();
+            }
+            ImGui::EndTabBar();
+        }
+
+        ImGui::Spacing();
+
+        //IMAGE DISPLAY SECTION 
+        if (darkMode) {
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+        }
+        else {
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+        }
+        ImGui::BeginChild("ImageDisplay", ImVec2(0, 400), true);
+
+        ImGui::Columns(2, "ImageDisplayColumns", true);
+
+        // Original image
+        if (darkMode) {
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+        }
+        else {
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+        }
+        ImGui::BeginChild("OriginalImage", ImVec2(0, 350), true);
+        if (darkMode) {
+            ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1.0f), "ORIGINAL IMAGE");
+        }
+        else {
+            ImGui::TextColored(ImVec4(0.0f, 0.6f, 0.2f, 1.0f), "ORIGINAL IMAGE");
+        }
+
+        if (!imgOriginal.empty()) {
+            matToTexture(imgOriginal, texOriginal);
+            ImGui::SetCursorPosX((ImGui::GetWindowWidth() - 350) / 2);
+            ImGui::Image((void*)(intptr_t)texOriginal, ImVec2(350, 280));
+        }
+        else {
+            ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 100);
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 120);
+            if (darkMode) {
+                ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "No Image Loaded");
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 80);
+                ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.8f, 1.0f), "Click 'Upload Image' to start");
+            }
+            else {
+                ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "No Image Loaded");
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 80);
+                ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Click 'Upload Image' to start");
+            }
+        }
+
+        ImGui::EndChild();
+        ImGui::PopStyleColor();
+
+        ImGui::NextColumn();
+
+        // Processed image
+        if (darkMode) {
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+        }
+        else {
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+        }
+        ImGui::BeginChild("ProcessedImage", ImVec2(0, 350), true);
+        if (darkMode) {
+            ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.3f, 1.0f), "PROCESSED IMAGE");
+        }
+        else {
+            ImGui::TextColored(ImVec4(0.8f, 0.2f, 0.0f, 1.0f), "PROCESSED IMAGE");
+        }
+
+        if (!imgProcessed.empty()) {
+            matToTexture(imgProcessed, texProcessed);
+            ImGui::SetCursorPosX((ImGui::GetWindowWidth() - 350) / 2);
+            ImGui::Image((void*)(intptr_t)texProcessed, ImVec2(350, 280));
+        }
+        else {
+            ImGui::SetCursorPosY(ImGui::GetCursorPosY() + 100);
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 120);
+            if (darkMode) {
+                ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Processing Results");
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 80);
+                ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.8f, 1.0f), "Apply filters to see results");
+            }
+            else {
+                ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Processing Results");
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 80);
+                ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Apply filters to see results");
+            }
+        }
+
+        ImGui::EndChild();
+        ImGui::PopStyleColor();
+
+        ImGui::Columns(1);
+
+        // HISTOGRAM DISPLAY UNDER IMAGES (MAIN TOOLBOX WINDOW)
+        if (!imgOriginal.empty() && texHistogram != 0) {
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+
+            if (darkMode) {
+                ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.0f, 1.0f), "IMAGE HISTOGRAM");
+            }
+            else {
+                ImGui::TextColored(ImVec4(0.0f, 0.4f, 0.8f, 1.0f), "IMAGE HISTOGRAM");
+            }
+
+            ImGui::SetCursorPosX((ImGui::GetWindowWidth() - 512) / 2);
+            ImGui::Image((void*)(intptr_t)texHistogram, ImVec2(512, 200));
+
+            ImGui::Spacing();
+            ImGui::Text("Histogram shows intensity distribution of the processed image");
+        }
+
+        ImGui::EndChild();
+        ImGui::PopStyleColor();
+
+        //IMAGE INFO SECTION
+        if (!imgOriginal.empty() && showImageInfo) {
+            if (darkMode) {
+                ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.0f, 0.0f, 0.0f, 1.0f));
+            }
+            else {
+                ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+            }
+            ImGui::Spacing();
+            ImGui::BeginChild("ImageInfo", ImVec2(0, 120), true);
+
+            if (darkMode) {
+                ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.0f, 1.0f), "IMAGE STATISTICS");
+            }
+            else {
+                ImGui::TextColored(ImVec4(0.0f, 0.4f, 0.8f, 1.0f), "IMAGE STATISTICS");
+            }
+
+            double minVal, maxVal;
+            minMaxLoc(imgOriginal, &minVal, &maxVal);
+
+            ImGui::Columns(4, "StatsColumns", true);
+
+            ImGui::Text("Original Image:");
+            ImGui::Text("%d x %d", imgOriginal.cols, imgOriginal.rows);
+            ImGui::Text("Channels: %d", imgOriginal.channels());
+
+            ImGui::NextColumn();
+
+            if (!imgProcessed.empty() && imgProcessed.channels() == 1) {
+                ImGui::Text("Grayscale Image:");
+                ImGui::Text("%d x %d", imgProcessed.cols, imgProcessed.rows);
+                ImGui::Text("Channels: %d (Gray)", imgProcessed.channels());
+            }
+            else {
+                ImGui::Text("Processed Image:");
+                if (!imgProcessed.empty()) {
+                    ImGui::Text("%d x %d", imgProcessed.cols, imgProcessed.rows);
+                    ImGui::Text("Channels: %d", imgProcessed.channels());
+                }
+                else {
+                    ImGui::Text("No processing");
+                }
+            }
+
+            ImGui::NextColumn();
+            ImGui::Text("Min/Max Values:");
+            ImGui::Text("%.1f / %.1f", minVal, maxVal);
+            ImGui::Text("Dynamic Range:");
+            ImGui::Text("%.1f", maxVal - minVal);
+
+            ImGui::NextColumn();
+            ImGui::Text("Type:");
+            ImGui::Text("%d", imgOriginal.type());
+
+            ImGui::Columns(1);
+            ImGui::EndChild();
+            ImGui::PopStyleColor();
+        }
+
+        //FOOTER SECTION
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        ImGui::BeginChild("Footer", ImVec2(0, 40), false);
+        ImGui::Columns(2, "FooterColumns", false);
+
+        if (darkMode) {
+            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Image Processing Project");
+        }
+        else {
+            ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Image Processing Project");
+        }
+
+        ImGui::NextColumn();
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 200);
+        if (darkMode) {
+            ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "Built with OpenCV, ImGui & GLFW");
+        }
+        else {
+            ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "Built with OpenCV, ImGui & GLFW");
+        }
+
+        ImGui::Columns(1);
+        ImGui::EndChild();
+
+        ImGui::End();
+
+        //REAL-TIME TRANSFORM PREVIEW 
+        if (realTimeTransform && !imgOriginal.empty()) {
+            Mat tmp;
+            imgOriginal.copyTo(tmp);
+            Mat TM = (Mat_<float>(2, 3) << zoomScale, 0, transX, 0, zoomScale, transY);
+            warpAffine(tmp, imgProcessed, TM, imgOriginal.size());
+            Mat R = getRotationMatrix2D(Point2f(imgOriginal.cols / 2, imgOriginal.rows / 2), rotateAngle, 1);
+            warpAffine(imgProcessed, imgProcessed, R, imgOriginal.size());
+            matToTexture(imgProcessed, texProcessed);
+        }
+
+        // Rendering
+        ImGui::Render();
+        int display_w, display_h;
+        glfwGetFramebufferSize(window, &display_w, &display_h);
+        glViewport(0, 0, display_w, display_h);
+        if (darkMode) {
+            glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+        }
+        else {
+            glClearColor(1.0f, 1.0f, 1.0f, 1.0f);
+        }
+        glClear(GL_COLOR_BUFFER_BIT);
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        glfwSwapBuffers(window);
+    }
+
+    // Cleanup
+    ImGui_ImplOpenGL3_Shutdown();
+    ImGui_ImplGlfw_Shutdown();
+    ImGui::DestroyContext();
+    glfwDestroyWindow(window);
+    glfwTerminate();
+    return 0;
+}
